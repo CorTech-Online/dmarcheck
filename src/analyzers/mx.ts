@@ -41,6 +41,16 @@ const PROVIDER_SIGNATURES: ProviderSignature[] = [
     name: "Symantec/Broadcom",
     category: "security-gateway",
   },
+  {
+    pattern: /\.cf-emailsecurity\.net$/,
+    name: "Cloudflare Email Security",
+    category: "security-gateway",
+  },
+  {
+    pattern: /\.junkemailfilter\.(com|net|org)$/,
+    name: "MX Guarddog",
+    category: "security-gateway",
+  },
 
   // Email platforms
   {

@@ -57,6 +57,33 @@ describe("detectProviders", () => {
     expect(providers.map((p) => p.name)).toContain("Google Workspace");
   });
 
+  it("detects Cloudflare Email Security from cf-emailsecurity.net exchange", () => {
+    const providers = detectProviders([
+      { exchange: "mxa.global.inbound.cf-emailsecurity.net" },
+    ]);
+    expect(providers).toEqual([
+      { name: "Cloudflare Email Security", category: "security-gateway" },
+    ]);
+  });
+
+  it("detects MX Guarddog from junkemailfilter.com/.net/.org exchanges", () => {
+    for (const tld of ["com", "net", "org"]) {
+      const providers = detectProviders([
+        { exchange: `mx.junkemailfilter.${tld}` },
+      ]);
+      expect(providers).toEqual([
+        { name: "MX Guarddog", category: "security-gateway" },
+      ]);
+    }
+  });
+
+  it("does not detect Cloudflare Email Routing as a security gateway", () => {
+    const providers = detectProviders([
+      { exchange: "route1.mx.cloudflare.net" },
+    ]);
+    expect(providers).toEqual([]);
+  });
+
   it("returns empty array for unknown exchanges", () => {
     const providers = detectProviders([
       { exchange: "mail.custom-server.example.org" },
