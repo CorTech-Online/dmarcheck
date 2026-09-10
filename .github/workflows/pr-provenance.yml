@@ -1,0 +1,121 @@
+name: PR provenance
+
+# Server-side enforcement of routine-gate Condition 1: "only these issue authors
+# can ever reach auto-merge" (scripts/routine-gate/config.ts).
+#
+# WHY THIS EXISTS. External contributors cannot merge here — they have no write
+# access. The reachable attack is indirect: a malicious GitHub *issue* that an
+# autonomous routine picks up, implements, and self-merges. The attacker never
+# needs write access, only for an agent to act on their text.
+#
+# That chain was previously blocked only client-side — the author-trust gate in
+# cc-routine/implement-from-issue §1, and scripts/routine-gate/. Both live in
+# agent instructions; a routine that does not load the skill bypasses them. The
+# CODEOWNERS review gate was meant to be the server-side backstop but is inert
+# (`require_code_owner_review: true` is a no-op at `required_approving_review_count: 0`).
+#
+# WHY NOT JUST RUN gate.ts. Its contract is "may this auto-merge" (exit 0) vs
+# "escalate" (exit 2), which is a routine decision, not a merge-safety verdict.
+# It also fails a PR for missing `Closes #n`, >250 lines, >8 files, touching a
+# risk path, scope drift — and `if (!pr.ciAllGreen)`, which is circular for a
+# check that is itself part of CI. Making it required would block nearly every
+# real PR. This workflow enforces Condition 1 ONLY; every other condition stays
+# a routine-side auto-merge decision.
+#
+# Ordinary work is unaffected: a PR that links no issue, or links an issue from
+# an allowlisted author, passes. Agent autonomy is preserved — this is a status
+# check, not a human approval.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out allowlist source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Verify linked issues come from trusted authors
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          REPO: ${{ github.repository }}
+          API_URL: ${{ github.api_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Single source of truth: parse the allowlist out of the routine-gate
+          # config rather than duplicating it here. Fail closed if it cannot be
+          # read — an unparseable allowlist must not silently allow everything.
+          ALLOW=$(node -e '
+            const fs = require("fs");
+            const src = fs.readFileSync("scripts/routine-gate/config.ts", "utf8");
+            const m = src.match(/allowlistAuthors:\s*\[([^\]]*)\]/);
+            if (!m) { console.error("could not parse allowlistAuthors"); process.exit(1); }
+            const names = [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1].toLowerCase());
+            if (!names.length) { console.error("allowlistAuthors is empty"); process.exit(1); }
+            console.log(names.join(" "));
+          ')
+          echo "Trusted issue authors: $ALLOW"
+
+          # Collect every issue this PR claims to close, mirroring the strips in
+          # closesIssueRefs() (scripts/routine-gate/gate-core.ts): fenced code,
+          # inline code spans, HTML comments, and blockquote lines are removed
+          # first. Over-collecting is NOT safer here — a PR that merely quotes
+          # or triages an untrusted issue number in an example block would fail
+          # and become unmergeable, which is the same deadlock as a required
+          # context that never reports. The PR body is written by our own agent,
+          # not the attacker, so stripping cannot be used to smuggle anything in:
+          # a hidden ref simply means no ref, and routine-gate already fails
+          # closed on zero refs before auto-merge.
+          REFS=$(PR_BODY="${PR_BODY:-}" node -e '
+            const body = process.env.PR_BODY || "";
+            const cleaned = body
+              .replace(/```[\s\S]*?```/g, " ")
+              .replace(/`[^`\n]+`/g, " ")
+              .replace(/<!--[\s\S]*?-->/g, " ")
+              .replace(/<!--[^\n]*/g, " ")
+              .split("\n")
+              .filter((l) => !/^\s*>/.test(l))
+              .join("\n");
+            const refs = new Set();
+            for (const m of cleaned.matchAll(/\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/gi)) {
+              refs.add(Number(m[1]));
+            }
+            console.log([...refs].sort((a, b) => a - b).join("\n"));
+          ')
+
+          if [ -z "$REFS" ]; then
+            echo "PR links no issue — nothing to verify. Passing."
+            exit 0
+          fi
+
+          FAILED=0
+          for N in $REFS; do
+            AUTHOR=$(gh api "repos/$REPO/issues/$N" --jq '.user.login' 2>/dev/null || echo "")
+            if [ -z "$AUTHOR" ]; then
+              echo "::error::Linked issue #$N could not be read — failing closed."
+              FAILED=1
+              continue
+            fi
+            LOWER=$(printf '%s' "$AUTHOR" | tr '[:upper:]' '[:lower:]')
+            if printf '%s\n' $ALLOW | grep -qx "$LOWER"; then
+              echo "Issue #$N by @$AUTHOR — trusted."
+            else
+              echo "::error::Issue #$N was authored by @$AUTHOR, who is not on the trusted-author allowlist in scripts/routine-gate/config.ts. A PR implementing an untrusted issue cannot merge. If this issue is legitimate, have an allowlisted maintainer re-file or vouch for it."
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+          echo "All linked issues come from trusted authors."
