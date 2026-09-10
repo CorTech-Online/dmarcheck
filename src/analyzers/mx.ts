@@ -41,6 +41,19 @@ const PROVIDER_SIGNATURES: ProviderSignature[] = [
     name: "Symantec/Broadcom",
     category: "security-gateway",
   },
+  {
+    // Formerly Area 1. Distinct from Cloudflare Email Routing
+    // (*.mx.cloudflare.net), which forwards rather than filters and is
+    // deliberately not listed here.
+    pattern: /\.cf-emailsecurity\.net$/,
+    name: "Cloudflare Email Security",
+    category: "security-gateway",
+  },
+  {
+    pattern: /\.junkemailfilter\.(com|net|org)$/,
+    name: "MX Guarddog",
+    category: "security-gateway",
+  },
 
   // Email platforms
   {

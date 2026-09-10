@@ -70,6 +70,37 @@ describe("detectProviders", () => {
       { name: "Google Workspace", category: "email-platform" },
     ]);
   });
+
+  it("detects Cloudflare Email Security from cf-emailsecurity.net exchange", () => {
+    const providers = detectProviders([
+      { exchange: "mxa.global.inbound.cf-emailsecurity.net" },
+      { exchange: "mxb.global.inbound.cf-emailsecurity.net" },
+    ]);
+    expect(providers).toEqual([
+      { name: "Cloudflare Email Security", category: "security-gateway" },
+    ]);
+  });
+
+  it("detects MX Guarddog across all three junkemailfilter TLDs", () => {
+    for (const exchange of [
+      "mx.junkemailfilter.com",
+      "mx.junkemailfilter.net",
+      "mx.junkemailfilter.org",
+    ]) {
+      expect(detectProviders([{ exchange }]), exchange).toEqual([
+        { name: "MX Guarddog", category: "security-gateway" },
+      ]);
+    }
+  });
+
+  it("does not report Cloudflare Email Routing as a security gateway", () => {
+    // Email Routing (mx.cloudflare.net) is forwarding, not filtering — it must
+    // not be confused with Cloudflare Email Security (cf-emailsecurity.net).
+    const providers = detectProviders([
+      { exchange: "route1.mx.cloudflare.net" },
+    ]);
+    expect(providers).toEqual([]);
+  });
 });
 
 describe("analyzeMx", () => {
