@@ -31,39 +31,23 @@ const customDnsServers =
     ? parseDnsServers(process.env?.DNS_SERVERS)
     : null;
 
-function createResolver(): dns.promises.Resolver {
-  const r = new dns.promises.Resolver();
-  if (customDnsServers) {
-    try {
-      r.setServers(customDnsServers);
-    } catch (err) {
-      console.warn("Failed to apply DNS_SERVERS override:", err);
-    }
+// One module-level handle is correct here. workerd's node:dns is a DoH client
+// over fetch(), and its `Resolver` is a stateless pass-through — every method
+// is `return moduleFunction(...args)`, it holds no socket and no per-instance
+// query state, and setServers() is a no-op. #701 added a
+// RESOLVER_RESET_THRESHOLD that recreated this handle every 50 queries on the
+// theory that a c-ares handle was accumulating queries; the workerd binary
+// contains zero `ares_` symbols, so there was no handle to recycle and the
+// reset could not affect anything. Removed rather than left as dead code, so
+// the next reader is not handed a disproven model. The real bound on cron DNS
+// work is the per-invocation ceiling in src/cron/rescan.ts (#700).
+const resolver = new dns.promises.Resolver();
+if (customDnsServers) {
+  try {
+    resolver.setServers(customDnsServers);
+  } catch (err) {
+    console.warn("Failed to apply DNS_SERVERS override:", err);
   }
-  return r;
-}
-
-// #700 — a single resolver handle reused for every query across an entire
-// scheduled() cron invocation accumulates queries until the workerd node:dns
-// polyfill's underlying c-ares handle starts returning EBADQUERY for every
-// subsequent query — empirically at a fixed cumulative count around 200 on
-// one handle, well within a single large cron run (hundreds of domains).
-// The interactive /check path never approaches this (one scan issues at most
-// a few dozen queries), so recreating the handle well under that ceiling
-// bounds any one handle's lifetime without affecting single-scan latency —
-// constructing a Resolver does no I/O.
-const RESOLVER_RESET_THRESHOLD = 50;
-
-let resolver = createResolver();
-let queriesSinceReset = 0;
-
-function currentResolver(): dns.promises.Resolver {
-  if (queriesSinceReset >= RESOLVER_RESET_THRESHOLD) {
-    resolver = createResolver();
-    queriesSinceReset = 0;
-  }
-  queriesSinceReset++;
-  return resolver;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -124,7 +108,7 @@ export async function queryTxt(
   });
   try {
     const records = await withTimeout(
-      currentResolver().resolveTxt(name),
+      resolver.resolveTxt(name),
       DNS_TIMEOUT_MS,
     );
     // workerd's node:dns polyfill may join multi-part TXT chunks with literal
@@ -294,10 +278,7 @@ export async function queryMx(
     level: "info",
   });
   try {
-    const records = await withTimeout(
-      currentResolver().resolveMx(name),
-      DNS_TIMEOUT_MS,
-    );
+    const records = await withTimeout(resolver.resolveMx(name), DNS_TIMEOUT_MS);
     return records.map((r) => ({ priority: r.priority, exchange: r.exchange }));
   } catch (err: unknown) {
     if (isDnsAbsent(err)) {

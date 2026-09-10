@@ -1,38 +1,25 @@
 import { describe, expect, it, vi } from "vitest";
 
-// #700 — each Resolver instance "dies" (throws EBADQUERY on every subsequent
-// call) once it exceeds PER_INSTANCE_LIMIT queries, simulating the c-ares
-// handle exhaustion a long cron run hits on a single reused handle. If
-// src/dns/client.ts recreates the handle well before this point, no instance
-// should ever see a call past its own limit.
-const { instanceLog, PER_INSTANCE_LIMIT } = vi.hoisted(() => ({
-  instanceLog: [] as number[],
-  PER_INSTANCE_LIMIT: 60,
+// node:dns is stubbed only so importing the client doesn't reach the network.
+// Deliberately NOT a per-Resolver-instance failure model: workerd's Resolver
+// is a stateless pass-through with no per-instance query state, so a test
+// asserting a per-instance limit would encode a mechanism that does not
+// exist (#700).
+vi.mock("node:dns", () => ({
+  default: {
+    promises: {
+      Resolver: class {
+        setServers() {}
+        async resolveMx() {
+          return [{ priority: 10, exchange: "mail.example.com" }];
+        }
+        async resolveTxt() {
+          return [["v=spf1 -all"]];
+        }
+      },
+    },
+  },
 }));
-
-vi.mock("node:dns", () => {
-  class Resolver {
-    private calls = 0;
-    constructor() {
-      instanceLog.push(0);
-    }
-    setServers() {}
-    async resolveMx(name: string) {
-      this.calls++;
-      instanceLog[instanceLog.length - 1] = this.calls;
-      if (this.calls > PER_INSTANCE_LIMIT) {
-        throw Object.assign(new Error(`queryMX EBADQUERY ${name}`), {
-          code: "EBADQUERY",
-        });
-      }
-      return [{ priority: 10, exchange: "mail.example.com" }];
-    }
-    async resolveTxt() {
-      throw Object.assign(new Error("queryTxt ENODATA"), { code: "ENODATA" });
-    }
-  }
-  return { default: { promises: { Resolver } } };
-});
 
 vi.mock("@sentry/cloudflare", () => ({
   addBreadcrumb: vi.fn(),
@@ -42,7 +29,6 @@ vi.mock("@sentry/cloudflare", () => ({
 import {
   DnsLookupError,
   parseDnsServers,
-  queryMx,
   toDnsLookupError,
 } from "../src/dns/client.js";
 
@@ -114,22 +100,5 @@ describe("toDnsLookupError (#700)", () => {
 
   it("returns null for an error with no code (not a DNS-shaped error)", () => {
     expect(toDnsLookupError(new Error("unexpected"))).toBeNull();
-  });
-});
-
-describe("resolver handle reset under sustained query volume (#700)", () => {
-  it("recreates the resolver well before any single handle sees EBADQUERY across 300 sequential MX queries", async () => {
-    const TOTAL = 300;
-    for (let i = 0; i < TOTAL; i++) {
-      const result = await queryMx(`domain-${i}.example`);
-      expect(result).toEqual([{ priority: 10, exchange: "mail.example.com" }]);
-    }
-
-    // No instance was ever driven past its failure threshold — the reset
-    // logic must have swapped in a fresh handle before that happened.
-    expect(Math.max(...instanceLog)).toBeLessThanOrEqual(PER_INSTANCE_LIMIT);
-    // Proof this isn't vacuous: the reset actually fired multiple times
-    // across 300 queries rather than one handle happening to survive.
-    expect(instanceLog.length).toBeGreaterThan(1);
   });
 });

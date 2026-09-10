@@ -1,11 +1,15 @@
 /**
- * Regression test for #700 — a long-lived cron rescan cumulatively exhausts
- * the shared node:dns resolver handle (c-ares EBADQUERY) partway through a
- * large run. Before this fix, the misclassified EBADQUERY bare-threw out of
- * analyzeMx, and because analyzeDkim/analyzeDane/analyzeDnsbl are chained off
- * the same raw MX promise (`mxPromise.then(...)`), that rejection cascaded
- * into all of them via the orchestrator's settle() fallback — tanking DKIM's
- * scored status and producing false grade/protocol-regression alerts.
+ * Regression test for #700 — a long cron rescan exhausts the invocation's
+ * outbound subrequest allowance partway through, and every DNS lookup after
+ * that point fails with EBADQUERY for the rest of the invocation.
+ *
+ * The mock below models that allowance the way workerd actually behaves: ONE
+ * counter shared by every query in the invocation, which never recovers once
+ * spent. It is deliberately NOT a per-Resolver-instance limit — workerd's
+ * `node:dns` is a DoH client over fetch() and its `Resolver` is a stateless
+ * pass-through with no per-instance query state, so a per-instance model would
+ * assert a mechanism that does not exist (and would pass while the real bug
+ * remained live, which is what happened in #701).
  *
  * This exercises the REAL DNS client (src/dns/client.ts) and REAL analyzeMx
  * through the REAL scan() used by runDueRescans's default scanFn — only
@@ -14,26 +18,32 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// Each Resolver instance "dies" (throws EBADQUERY on every subsequent call)
-// once it exceeds PER_INSTANCE_LIMIT queries — simulating the c-ares handle
-// exhaustion from #700. If the client resets the handle well before this
-// point, no instance run through a 260-domain cron pass should ever see it.
-const PER_INSTANCE_LIMIT = 60;
+// One shared, per-invocation allowance: once SUBREQUEST_BUDGET lookups have
+// been issued, every subsequent lookup throws EBADQUERY and never recovers —
+// exactly what the production cliff looked like.
+const { budget, SUBREQUEST_BUDGET } = vi.hoisted(() => ({
+  budget: { used: 0 },
+  SUBREQUEST_BUDGET: 120,
+}));
+
+function spendOrThrow(name: string): void {
+  budget.used++;
+  if (budget.used > SUBREQUEST_BUDGET) {
+    throw Object.assign(new Error(`queryMx EBADQUERY ${name}`), {
+      code: "EBADQUERY",
+    });
+  }
+}
 
 vi.mock("node:dns", () => {
   class Resolver {
-    private calls = 0;
     setServers() {}
     async resolveMx(name: string) {
-      this.calls++;
-      if (this.calls > PER_INSTANCE_LIMIT) {
-        throw Object.assign(new Error(`queryMX EBADQUERY ${name}`), {
-          code: "EBADQUERY",
-        });
-      }
+      spendOrThrow(name);
       return [{ priority: 10, exchange: "mail.example.com" }];
     }
-    async resolveTxt() {
+    async resolveTxt(name: string) {
+      spendOrThrow(name);
       throw Object.assign(new Error("queryTxt ENODATA"), { code: "ENODATA" });
     }
   }
@@ -284,9 +294,10 @@ describe("runDueRescans resolver exhaustion regression (#700)", () => {
     alerts = new Map();
     nextScanId = 1;
     nextAlertId = 1;
+    budget.used = 0;
   });
 
-  it("a 260-domain cron run produces zero EBADQUERY, no positional failure cliff, and no false alerts", async () => {
+  it("a 260-domain cron run stops cleanly when the subrequest allowance runs out — no false grades, no alerts, no positional cliff", async () => {
     // Baseline: what a healthy scan produces against the same mocked
     // dependency graph, while the resolver still has plenty of headroom.
     const baseline = await scan("baseline.example", [], {});
@@ -306,24 +317,28 @@ describe("runDueRescans resolver exhaustion regression (#700)", () => {
       });
     }
 
-    // maxDomainsPerRun is pinned to TOTAL here so this test keeps measuring
-    // what it was written to measure — DNS-layer resolver exhaustion across a
-    // long run — rather than the separate per-invocation domain ceiling added
-    // for #700 (default 150, covered by test/cron-rescan.test.ts).
+    // maxDomainsPerRun is pinned to TOTAL so the allowance below, not the
+    // default per-invocation domain ceiling, is what ends this run — the
+    // ceiling has its own coverage in test/cron-rescan.test.ts.
     const result = await runDueRescans({
       db: makeD1Mock(),
       now,
       maxDomainsPerRun: TOTAL,
     });
 
-    expect(result.scanned).toBe(TOTAL);
-    expect(result.errors).toBe(0);
-    // No cascade-driven grade-drop / protocol-regression alerts anywhere in
-    // the run — every domain's grade must match the healthy baseline.
+    // The run stops instead of grinding the remaining domains through a
+    // resolver that can no longer issue a single query.
+    expect(result.scanned).toBeGreaterThan(0);
+    expect(result.scanned).toBeLessThan(TOTAL);
+    expect(result.skipped).toBeGreaterThan(0);
+    expect(result.scanned + result.errors + result.skipped).toBe(TOTAL);
+
+    // Nothing unverifiable was persisted, and nothing was alerted on.
     expect(result.alerts).toBe(0);
+    expect(alerts.size).toBe(0);
 
     const rows = [...history.values()];
-    expect(rows).toHaveLength(TOTAL);
+    expect(rows).toHaveLength(result.scanned);
 
     for (const row of rows) {
       expect(row.grade).toBe(baselineGrade);
@@ -338,8 +353,17 @@ describe("runDueRescans resolver exhaustion regression (#700)", () => {
       expect(protocols.dkim.status).not.toBe("fail");
     }
 
-    // No domain_id bucket shows the 100%-failure cliff from #700 (bucket
-    // failure rate must stay flat at 0% throughout the run).
+    // Every domain past the cliff is left DUE rather than false-graded, so the
+    // next invocation picks it up first (`ORDER BY last_scanned_at ASC`).
+    const scannedIds = new Set(rows.map((r) => r.domain_id));
+    for (let id = 1; id <= TOTAL; id++) {
+      if (scannedIds.has(id)) continue;
+      expect(domains.get(id)?.last_grade).toBe(baselineGrade);
+      expect(domains.get(id)?.last_scanned_at).toBeLessThan(now);
+    }
+
+    // No domain_id bucket shows the 100%-failure cliff from #700: a bucket is
+    // either scanned cleanly or not scanned at all, never scanned-and-failed.
     const bucketSize = 40;
     for (let start = 0; start < TOTAL; start += bucketSize) {
       const bucket = rows.filter(

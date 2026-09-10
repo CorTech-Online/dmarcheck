@@ -116,15 +116,60 @@ function resultChanged(
 // #700 — a scan whose DNS lookups failed is not a verdict about the domain.
 // These three protocols determine the grade: scoring.ts returns a flat D on a
 // DMARC lookup_error, and MX/SPF drive the modifiers. If any of them could not
-// be read, the computed grade describes the resolver, not the domain, so it
-// must not be stored, compared against history, or alerted on. Storing it is
-// what put 156 domains on false D grades and fired 137 alerts in one run.
+// be read, the computed grade describes the lookup, not the domain, so it is
+// never alerted on. Alerting on it is what fired 137 alerts in one run.
 const GRADE_CRITICAL_PROTOCOLS = ["dmarc", "spf", "mx"] as const;
 
-function isResolverDegraded(result: ScanResult): boolean {
-  return GRADE_CRITICAL_PROTOCOLS.some(
-    (id) => result.protocols[id].lookup_error !== undefined,
-  );
+function lookupErrorCode(result: ScanResult): string | null {
+  for (const id of GRADE_CRITICAL_PROTOCOLS) {
+    const code = result.protocols[id].lookup_error?.code;
+    if (code) return code;
+  }
+  return null;
+}
+
+// Whose fault the lookup failure is decides whether we defer the domain or
+// record it. This distinction is load-bearing, not cosmetic:
+//
+//   OUR fault — the invocation could not issue the query at all. EBADQUERY is
+//   raised only when workerd's DoH fetch() itself throws, i.e. the
+//   per-invocation subrequest allowance is spent; BUDGET_EXCEEDED /
+//   SCAN_DEADLINE are our own guards; analyzer_error is an internal blow-up.
+//   These say nothing about the domain, so the result is discarded and the
+//   domain left due.
+//
+//   THE DOMAIN'S (or the network's) — DNS_TIMEOUT, ESERVFAIL, EBADRESP,
+//   EREFUSED: the query went out and came back bad. That IS a finding about
+//   the domain (real senders see it too), so it is recorded like any other
+//   result — just never alerted on.
+//
+// Deferring domain-side faults instead would starve the queue: `getDueDomains`
+// orders by `last_scanned_at ASC`, so a domain with dead nameservers would sort
+// FIRST on every subsequent run, hold a MAX_DOMAINS_PER_RUN slot forever, and —
+// once enough clustered at the head — trip DEGRADED_STREAK_LIMIT before a
+// single healthy domain was scanned. This portfolio already carries ~10 such
+// domains (the DNS_TIMEOUT set).
+const OUR_FAULT_CODES = new Set([
+  "EBADQUERY",
+  "BUDGET_EXCEEDED",
+  "SCAN_DEADLINE",
+  "analyzer_error",
+]);
+
+// Backstop for a fault we blame on ourselves that nevertheless never clears
+// (say an analyzer that reliably throws on one domain's records). Past this
+// much staleness the domain is recorded with its lookup_error anyway, so
+// `last_scanned_at` advances and it can never hold a slot indefinitely. The
+// invariant is unconditional: no domain can be deferred forever.
+const MAX_DEFERRAL_SECONDS = 3 * 24 * 60 * 60;
+
+function deferralExhausted(domain: Domain, now: number): boolean {
+  const cadence =
+    domain.scan_frequency === "monthly" ? 30 * 24 * 60 * 60 : 7 * 24 * 60 * 60;
+  // last_scanned_at null = never successfully scanned; measure from creation
+  // so a never-scannable domain can't sit at the head of NULLS FIRST forever.
+  const since = domain.last_scanned_at ?? domain.created_at;
+  return now - since > cadence + MAX_DEFERRAL_SECONDS;
 }
 
 async function rescanOne(
@@ -144,19 +189,19 @@ async function rescanOne(
     return { alerts: 0, error: err };
   }
 
-  // Leave last_scanned_at untouched so the domain stays due and is retried at
-  // the front of the next run's `ORDER BY last_scanned_at ASC` ordering.
-  if (isResolverDegraded(result)) {
+  // Our own fault and not yet stale enough to force through: discard the
+  // result and leave last_scanned_at untouched, so the domain stays due and is
+  // retried at the front of the next run's `ORDER BY last_scanned_at ASC`.
+  const errorCode = lookupErrorCode(result);
+  if (
+    errorCode &&
+    OUR_FAULT_CODES.has(errorCode) &&
+    !deferralExhausted(domain, deps.now)
+  ) {
     Sentry.addBreadcrumb({
       category: "cron.rescan",
-      message: `Skipping ${domain.domain}: DNS lookups could not be verified`,
-      data: {
-        domain: domain.domain,
-        code:
-          result.protocols.mx.lookup_error?.code ??
-          result.protocols.dmarc.lookup_error?.code ??
-          result.protocols.spf.lookup_error?.code,
-      },
+      message: `Deferring ${domain.domain}: could not issue DNS lookups (${errorCode})`,
+      data: { domain: domain.domain, code: errorCode },
       level: "warning",
     });
     return { alerts: 0, degraded: true };
@@ -183,14 +228,17 @@ async function rescanOne(
     });
   }
 
+  // An unverifiable scan is recorded (so the domain advances) but never
+  // alerted on: "your grade dropped to D" off a lookup we could not complete
+  // is the false-alarm this issue is about, whoever's fault the lookup was.
   const alerts: AlertPayload[] = [];
-  const gradeAlert = detectGradeDrop(domain.last_grade, result.grade);
-  if (gradeAlert) alerts.push(gradeAlert);
-  const protocolAlerts = detectProtocolRegressions(
-    prevStatuses,
-    extractStatuses(result),
-  );
-  alerts.push(...protocolAlerts);
+  if (!errorCode) {
+    const gradeAlert = detectGradeDrop(domain.last_grade, result.grade);
+    if (gradeAlert) alerts.push(gradeAlert);
+    alerts.push(
+      ...detectProtocolRegressions(prevStatuses, extractStatuses(result)),
+    );
+  }
 
   if (alerts.length > 0) {
     await recordAlerts(
@@ -233,9 +281,11 @@ const MAX_DOMAINS_PER_RUN = 150;
 
 // Backstop for when the ceiling above is still too high (a heavier-than-usual
 // portfolio, or a platform limit lower than the measured one). Once this many
-// domains in a row come back unverifiable, the invocation's outbound budget is
-// spent: continuing cannot produce a usable scan and only burns wall-clock, so
-// stop and let the next run pick the remainder up. 10 = two default batches.
+// domains in a row are DEFERRED — meaning we could not issue their lookups at
+// all — the invocation's outbound allowance is spent: continuing cannot produce
+// a usable scan and only burns wall-clock, so stop and let the next run pick up
+// the remainder. 10 = two default batches. Only deferrals count; domain-side
+// lookup failures and DB errors are recorded/counted but never halt the run.
 const DEGRADED_STREAK_LIMIT = 10;
 
 // Entry point for the scheduled() handler. Runs the rescan pipeline across
@@ -287,20 +337,24 @@ export async function runDueRescans(deps: RescanDeps): Promise<RescanResult> {
     );
     processed += batch.length;
     for (const outcome of outcomes) {
+      // A rejection here is a DB / webhook failure, not a DNS one (scan() is
+      // wrapped in rescanOne's try, and settle() means it does not reject for
+      // analyzer reasons). It must not trip the DNS circuit breaker — one bad
+      // row would otherwise halt the whole rescan.
       if (outcome.status === "rejected") {
         errors += 1;
-        degradedStreak += 1;
         Sentry.captureException(outcome.reason);
         continue;
       }
       if (outcome.value.error) {
         errors += 1;
-        degradedStreak += 1;
         Sentry.captureException(outcome.value.error);
         continue;
       }
       if (outcome.value.degraded) {
-        // Counted as an error, but nothing was written and nothing alerted.
+        // Only a deferral — i.e. we could not issue the query at all — counts
+        // toward the breaker. Domain-side faults are recorded, not deferred,
+        // so they can never halt a run.
         errors += 1;
         degradedStreak += 1;
         continue;
