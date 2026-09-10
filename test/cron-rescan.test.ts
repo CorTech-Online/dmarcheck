@@ -722,6 +722,51 @@ describe("cron/runDueRescans", () => {
       expect(result.errors).toBe(1);
     });
 
+    // #703 — a scan recorded with a domain-fault lookup_error (not deferred,
+    // since #702 records these so the queue advances) must not fire a
+    // scan_completed webhook asserting its grade either, for the same
+    // false-claim reason the alert is suppressed below.
+    it("does not fire scan_completed for a recorded-but-unverifiable domain-fault scan", async () => {
+      seedUser();
+      domains.set(1, {
+        id: 1,
+        user_id: "u1",
+        domain: "deadns.example",
+        is_free: 1,
+        scan_frequency: "weekly",
+        last_scanned_at: now - weekSeconds - 1,
+        last_grade: "B+",
+        created_at: 0,
+      });
+
+      const timeout = { code: "DNS_TIMEOUT", message: "DNS query timed out" };
+      const base = makeScanResult("deadns.example", "D", {});
+      const degraded = {
+        ...base,
+        protocols: {
+          ...base.protocols,
+          mx: { status: "warn", lookup_error: timeout },
+          dmarc: { status: "warn", lookup_error: timeout },
+          spf: { status: "warn", lookup_error: timeout },
+        },
+      };
+
+      const webhookFn = vi.fn().mockResolvedValue(undefined);
+      const result = await runDueRescans({
+        db: makeD1Mock(),
+        now,
+        scanFn: vi.fn().mockResolvedValue(degraded) as never,
+        fireWebhookFn: webhookFn as never,
+      });
+
+      // Recorded (domain-fault codes advance the queue per #702), but neither
+      // alerted on nor asserted via webhook.
+      expect(history.size).toBe(1);
+      expect(alerts.size).toBe(0);
+      expect(webhookFn).not.toHaveBeenCalled();
+      expect(result.scanned).toBe(1);
+    });
+
     it("does not cascade across a 260-domain run when the resolver dies mid-run", async () => {
       seedDueDomains(260);
 
@@ -792,11 +837,12 @@ describe("cron/runDueRescans", () => {
           : makeScanResult(domain, "A", {});
       });
 
+      const webhookFn = vi.fn().mockResolvedValue(undefined);
       const result = await runDueRescans({
         db: makeD1Mock(),
         now,
         scanFn: scanFn as never,
-        fireWebhookFn: vi.fn().mockResolvedValue(undefined) as never,
+        fireWebhookFn: webhookFn as never,
       });
 
       // The run is not halted by the broken head.
@@ -810,8 +856,10 @@ describe("cron/runDueRescans", () => {
       }
       expect(history.size).toBe(60);
 
-      // But an unverifiable scan still never produces an alert.
+      // But an unverifiable scan still never produces an alert or a webhook
+      // asserting its grade (#703) — only the 40 healthy domains fire one.
       expect(alerts.size).toBe(0);
+      expect(webhookFn).toHaveBeenCalledTimes(60 - BROKEN);
     });
 
     it("records a domain deferred past the deferral ceiling so it cannot occupy a slot forever", async () => {

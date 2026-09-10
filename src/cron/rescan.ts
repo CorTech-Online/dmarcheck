@@ -215,9 +215,15 @@ async function rescanOne(
     scannedAt: deps.now,
   });
 
+  // An unverifiable scan is recorded (so the domain advances) but never
+  // asserts its grade to an outbound channel: the same false-claim reasoning
+  // as the alert gate below applies to a webhook carrying `grade: "D"` for a
+  // scan we could not complete (#703).
   const user = await getUserById(deps.db, domain.user_id);
   const shouldFireWebhook =
-    !user?.notify_on_change_only || resultChanged(domain, prevStatuses, result);
+    !errorCode &&
+    (!user?.notify_on_change_only ||
+      resultChanged(domain, prevStatuses, result));
   if (shouldFireWebhook) {
     const fireWebhook = deps.fireWebhookFn ?? fireScanCompletedWebhook;
     await fireWebhook(deps.db, domain.user_id, {
