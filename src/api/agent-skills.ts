@@ -53,7 +53,9 @@ per request. See the OpenAPI doc for the request/response shape.
 ## Errors
 
 - \`400\` — invalid domain or selectors.
-- \`429\` — rate limit exceeded. Honor \`Retry-After\`.
+- \`429\` — rate limit exceeded. The response carries \`X-RateLimit-Reset\`
+  (absolute epoch seconds — the Unix time at which the current window ends).
+  Wait until \`X-RateLimit-Reset\` minus the current time before retrying.
 - \`5xx\` — transient. Retry with exponential backoff.
 
 ## Examples

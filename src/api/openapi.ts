@@ -29,6 +29,30 @@ const validations = {
   items: { $ref: "#/components/schemas/Validation" },
 } as const;
 
+// The four headers rateLimitHeaders() (src/rate-limit.ts) actually emits.
+// rateLimitMiddleware attaches these to both the successful response and the
+// 429 it returns on block, so every route it guards documents the same set —
+// there is no Retry-After header (see #709).
+const rateLimitResponseHeaders = {
+  "X-RateLimit-Limit": {
+    description: "Requests allowed in the current window.",
+    schema: { type: "integer" },
+  },
+  "X-RateLimit-Remaining": {
+    description: "Requests remaining in the current window.",
+    schema: { type: "integer" },
+  },
+  "X-RateLimit-Window": {
+    description: 'Window length, e.g. "60s".',
+    schema: { type: "string" },
+  },
+  "X-RateLimit-Reset": {
+    description:
+      "Absolute epoch seconds at which the current window resets. Compute the wait as this value minus the current time.",
+    schema: { type: "integer" },
+  },
+} as const;
+
 export const OPENAPI_DOCUMENT = {
   openapi: "3.1.0",
   info: {
@@ -89,9 +113,7 @@ export const OPENAPI_DOCUMENT = {
                   "`HIT` when the response was served from the SSE cache.",
                 schema: { type: "string", enum: ["HIT"] },
               },
-              "X-RateLimit-Limit": { schema: { type: "integer" } },
-              "X-RateLimit-Remaining": { schema: { type: "integer" } },
-              "X-RateLimit-Window": { schema: { type: "string" } },
+              ...rateLimitResponseHeaders,
             },
             content: {
               "application/json": {
@@ -115,6 +137,7 @@ export const OPENAPI_DOCUMENT = {
           },
           "429": {
             description: "Rate limit exceeded (10 req/min per IP)",
+            headers: rateLimitResponseHeaders,
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/Error" },
@@ -187,6 +210,7 @@ export const OPENAPI_DOCUMENT = {
           },
           "429": {
             description: "Rate limit exceeded",
+            headers: rateLimitResponseHeaders,
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/Error" },
@@ -273,6 +297,7 @@ export const OPENAPI_DOCUMENT = {
           },
           "429": {
             description: "Rate limit exceeded",
+            headers: rateLimitResponseHeaders,
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/Error" },
@@ -399,6 +424,7 @@ export const OPENAPI_DOCUMENT = {
           "429": {
             description:
               "Rate limit exceeded (rendered as an SVG `rate limited` badge)",
+            headers: rateLimitResponseHeaders,
             content: {
               "image/svg+xml": {
                 schema: { type: "string", format: "binary" },
@@ -528,6 +554,7 @@ export const OPENAPI_DOCUMENT = {
           },
           "429": {
             description: "Rate limit exceeded (10 req/min per IP)",
+            headers: rateLimitResponseHeaders,
             content: {
               "application/json": {
                 schema: { $ref: "#/components/schemas/Error" },

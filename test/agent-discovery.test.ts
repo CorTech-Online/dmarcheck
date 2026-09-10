@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { _resetAgentSkillsCache } from "../src/api/agent-skills.js";
 import { app } from "../src/index.js";
-import { _memoryStore } from "../src/rate-limit.js";
+import {
+  _memoryStore,
+  type RateLimitResult,
+  rateLimitHeaders,
+} from "../src/rate-limit.js";
 
 vi.mock("../src/cache.js", () => ({
   getCachedScan: vi.fn().mockResolvedValue(null),
@@ -320,6 +324,25 @@ describe("/.well-known/agent-skills/scan-domain/SKILL.md", () => {
     expect(body).toContain("# scan_domain");
     expect(body).toContain("/api/check");
     expect(body).toContain("/openapi.json");
+  });
+
+  it("never mentions Retry-After, matching what rateLimitHeaders() actually emits (#709)", async () => {
+    const res = await app.request(
+      "/.well-known/agent-skills/scan-domain/SKILL.md",
+    );
+    const body = await res.text();
+    expect(body).not.toContain("Retry-After");
+
+    const headers = rateLimitHeaders({
+      allowed: false,
+      remaining: 0,
+      limit: 10,
+      windowSec: 60,
+      resetAt: 0,
+      count: 11,
+    } satisfies RateLimitResult);
+    expect(Object.keys(headers)).not.toContain("Retry-After");
+    expect(headers).toHaveProperty("X-RateLimit-Reset");
   });
 });
 
