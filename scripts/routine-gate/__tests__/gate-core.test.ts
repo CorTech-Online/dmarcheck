@@ -3,6 +3,7 @@ import { CONFIG } from "../config.js";
 import { parseClosesIssue, isProvenanceTrusted, closesIssueRefs } from "../gate-core.js";
 import { touchesRiskPath, withinSizeEnvelope, scopeDrift } from "../gate-core.js";
 import { evaluateGate, type GateInput } from "../gate-core.js";
+import { evaluateProvenanceOnly } from "../gate-core.js";
 
 describe("CONFIG", () => {
   it("only allowlists the repo owner", () => {
@@ -199,6 +200,41 @@ describe("evaluateGate ambiguity + provenance source-of-truth", () => {
     const v = evaluateGate(i);
     expect(v.pass).toBe(false);
     expect(v.reasons.join(" ")).toMatch(/ambiguous Closes refs/);
+  });
+});
+
+describe("evaluateProvenanceOnly (#705, PR provenance required check)", () => {
+  it("PASSES a trusted author's linked issue", () => {
+    const issue = { number: 42, author: "schmug", labels: [], filePointers: [] };
+    const v = evaluateProvenanceOnly("Fixes the thing.\n\nCloses #42", issue, CONFIG);
+    expect(v).toEqual({ pass: true, reason: null });
+  });
+  it("PASSES a trusted author's issue even without the spec-approved label (Condition 1 only)", () => {
+    const issue = { number: 42, author: "schmug", labels: [], filePointers: [] };
+    expect(evaluateProvenanceOnly("Closes #42", issue, CONFIG).pass).toBe(true);
+  });
+  it("PASSES a PR with no linked issue (linkage is Condition 3, not this check)", () => {
+    expect(evaluateProvenanceOnly("no link here", null, CONFIG)).toEqual({ pass: true, reason: null });
+  });
+  it("PASSES a PR with ambiguous Closes refs (linkage stays routine-side)", () => {
+    expect(evaluateProvenanceOnly("Closes #42\nCloses #999", null, CONFIG).pass).toBe(true);
+  });
+  it("FAILS a stranger's issue", () => {
+    const issue = { number: 42, author: "drive-by", labels: [], filePointers: [] };
+    const v = evaluateProvenanceOnly("Closes #42", issue, CONFIG);
+    expect(v.pass).toBe(false);
+    expect(v.reason).toMatch(/not on allowlist/);
+  });
+  it("FAILS closed when the linked issue is unreadable", () => {
+    const v = evaluateProvenanceOnly("Closes #42", null, CONFIG);
+    expect(v.pass).toBe(false);
+    expect(v.reason).toMatch(/unreadable/);
+  });
+  it("FAILS when the fetched issue doesn't match the parsed Closes number", () => {
+    const issue = { number: 999, author: "schmug", labels: [], filePointers: [] };
+    const v = evaluateProvenanceOnly("Closes #42", issue, CONFIG);
+    expect(v.pass).toBe(false);
+    expect(v.reason).toMatch(/#42/);
   });
 });
 

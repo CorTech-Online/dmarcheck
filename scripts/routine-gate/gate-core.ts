@@ -50,6 +50,32 @@ export function isProvenanceTrusted(issue: IssueInfo | null, cfg: Cfg): boolean 
   );
 }
 
+export interface ProvenanceVerdict {
+  pass: boolean;
+  reason: string | null;
+}
+
+// Server-side backstop for routine-gate Condition 1 ONLY (#705): is the linked
+// issue's author on the allowlist? A PR linking no issue (or an ambiguous
+// `Closes` set) passes here — linkage itself is Condition 3, which stays a
+// routine-side auto-merge decision, not this check's job.
+export function evaluateProvenanceOnly(
+  prBody: string,
+  issue: IssueInfo | null,
+  cfg: Cfg,
+): ProvenanceVerdict {
+  const closes = parseClosesIssue(prBody);
+  if (closes === null) return { pass: true, reason: null };
+  if (!issue) return { pass: false, reason: `issue #${closes} unreadable (fail-closed)` };
+  if (issue.number !== closes) {
+    return { pass: false, reason: `PR closes #${closes} but evaluated issue is #${issue.number}` };
+  }
+  if (!cfg.allowlistAuthors.includes(issue.author)) {
+    return { pass: false, reason: `issue #${closes} author @${issue.author} not on allowlist` };
+  }
+  return { pass: true, reason: null };
+}
+
 function normalizePath(p: string): string {
   return p.replace(/^(\.\/)+/, "").replace(/\/{2,}/g, "/");
 }
