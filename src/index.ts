@@ -1455,6 +1455,10 @@ async function scheduled(
     scope.setTag("cron.scanned", String(rescanResult.scanned));
     scope.setTag("cron.alerts", String(rescanResult.alerts));
     scope.setTag("cron.errors", String(rescanResult.errors));
+    // #700 — due domains deferred to the next run by the per-invocation
+    // ceiling or the resolver circuit breaker. Persistently non-zero means the
+    // portfolio has outgrown one invocation's outbound subrequest allowance.
+    scope.setTag("cron.skipped", String(rescanResult.skipped));
 
     // Dispatch runs unconditionally — alerts from prior cron runs may still
     // be pending if the EMAIL binding was absent or failed previously.

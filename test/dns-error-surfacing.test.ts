@@ -30,6 +30,15 @@ function makeTimeoutError(): DnsLookupError {
   return new DnsLookupError("DNS_TIMEOUT", "DNS query timed out");
 }
 
+// #700 — workerd's node:dns is a DoH client over fetch(); EBADQUERY means the
+// outbound subrequest itself failed, so it says nothing about the domain.
+function makeBadQueryError(): DnsLookupError {
+  return new DnsLookupError(
+    "EBADQUERY",
+    "DNS query could not be sent (resolver unavailable)",
+  );
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
 });
@@ -57,6 +66,13 @@ describe("analyzeDmarc with DNS lookup errors", () => {
     const result = await analyzeDmarc("example.com");
     expect(result.status).toBe("warn");
     expect(result.lookup_error?.code).toBe("DNS_TIMEOUT");
+  });
+
+  it("returns warn + lookup_error on EBADQUERY, never a scored fail", async () => {
+    mockQueryTxt.mockRejectedValue(makeBadQueryError());
+    const result = await analyzeDmarc("appstate.edu");
+    expect(result.status).toBe("warn");
+    expect(result.lookup_error?.code).toBe("EBADQUERY");
   });
 
   it("re-throws non-DnsLookupError errors", async () => {
@@ -98,6 +114,13 @@ describe("analyzeSpf with DNS lookup errors", () => {
     expect(result.lookup_error?.code).toBe("DNS_TIMEOUT");
   });
 
+  it("returns warn + lookup_error on EBADQUERY, never a scored fail", async () => {
+    mockQueryTxt.mockRejectedValue(makeBadQueryError());
+    const result = await analyzeSpf("appstate.edu");
+    expect(result.status).toBe("warn");
+    expect(result.lookup_error?.code).toBe("EBADQUERY");
+  });
+
   it("still returns fail when no SPF record exists", async () => {
     mockQueryTxt.mockResolvedValue(null);
     const result = await analyzeSpf("example.com");
@@ -116,6 +139,14 @@ describe("analyzeMx with DNS lookup errors", () => {
       code: "ESERVFAIL",
       message: "DNS server failure (SERVFAIL)",
     });
+  });
+
+  it("returns warn + lookup_error on EBADQUERY, never a scored fail", async () => {
+    mockQueryMx.mockRejectedValue(makeBadQueryError());
+    const result = await analyzeMx("appstate.edu");
+    expect(result.status).toBe("warn");
+    expect(result.records).toEqual([]);
+    expect(result.lookup_error?.code).toBe("EBADQUERY");
   });
 
   it("still returns info with empty records when no MX exists", async () => {

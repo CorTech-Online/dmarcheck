@@ -246,7 +246,7 @@ describe("cron/runDueRescans", () => {
       scanFn: scanFn as never,
     });
 
-    expect(result).toEqual({ scanned: 1, alerts: 0, errors: 0 });
+    expect(result).toEqual({ scanned: 1, alerts: 0, errors: 0, skipped: 0 });
     expect(scanFn).toHaveBeenCalledWith("stale.com");
     expect(history.size).toBe(1);
     expect([...history.values()][0].grade).toBe("A");
@@ -632,6 +632,239 @@ describe("cron/runDueRescans", () => {
       });
 
       expect(webhookFn).toHaveBeenCalledOnce();
+    });
+  });
+  // #700 — the weekly full-portfolio run exhausted the invocation's outbound
+  // subrequest allowance partway through. workerd's node:dns is a DoH client
+  // over fetch(), so every lookup is a subrequest; once the allowance is gone
+  // every remaining fetch() throws and the polyfill reports EBADQUERY for the
+  // rest of the invocation. 147 of 147 domains past that point were graded
+  // D/F off the resolver fault and 137 alerts fired in one run.
+  describe("resolver exhaustion (#700)", () => {
+    const lookupError = { code: "EBADQUERY", message: "queryMx EBADQUERY x" };
+
+    // What the orchestrator now produces once EBADQUERY is classified as a
+    // DnsLookupError: warn + lookup_error on every DNS-backed protocol.
+    function makeDegradedScanResult(domain: string) {
+      const base = makeScanResult(domain, "D", {});
+      return {
+        ...base,
+        protocols: {
+          mx: { status: "warn", lookup_error: lookupError },
+          dmarc: { status: "warn", lookup_error: lookupError },
+          spf: { status: "warn", lookup_error: lookupError },
+          dkim: { status: "fail" },
+          bimi: { status: "fail" },
+          mta_sts: { status: "fail" },
+        },
+      };
+    }
+
+    function seedUser(): void {
+      users.set("u1", {
+        id: "u1",
+        email: "user@example.com",
+        email_domain: "example.com",
+        stripe_customer_id: null,
+        email_alerts_enabled: 1,
+        notify_on_change_only: 0,
+        api_key_retirement_acknowledged_at: null,
+        created_at: 0,
+      });
+    }
+
+    function seedDueDomains(count: number): void {
+      seedUser();
+      for (let i = 1; i <= count; i++) {
+        domains.set(i, {
+          id: i,
+          user_id: "u1",
+          domain: `d${i}.example`,
+          is_free: 1,
+          scan_frequency: "weekly",
+          last_scanned_at: now - weekSeconds - 1000 + i,
+          last_grade: "A",
+          created_at: 0,
+        });
+      }
+    }
+
+    it("does not record or alert on a scan the resolver could not verify", async () => {
+      seedUser();
+      domains.set(1, {
+        id: 1,
+        user_id: "u1",
+        domain: "appstate.edu",
+        is_free: 1,
+        scan_frequency: "weekly",
+        last_scanned_at: now - weekSeconds - 1,
+        last_grade: "B+",
+        created_at: 0,
+      });
+
+      const webhookFn = vi.fn().mockResolvedValue(undefined);
+      const result = await runDueRescans({
+        db: makeD1Mock(),
+        now,
+        scanFn: vi
+          .fn()
+          .mockResolvedValue(makeDegradedScanResult("appstate.edu")) as never,
+        fireWebhookFn: webhookFn as never,
+      });
+
+      expect(history.size).toBe(0);
+      expect(alerts.size).toBe(0);
+      expect(webhookFn).not.toHaveBeenCalled();
+      // Grade and due-ness are left untouched, so the next run retries it.
+      expect(domains.get(1)?.last_grade).toBe("B+");
+      expect(domains.get(1)?.last_scanned_at).toBe(now - weekSeconds - 1);
+      expect(result.scanned).toBe(0);
+      expect(result.errors).toBe(1);
+    });
+
+    it("does not cascade across a 260-domain run when the resolver dies mid-run", async () => {
+      seedDueDomains(260);
+
+      const healthyScans = 40;
+      let calls = 0;
+      const scanFn = vi.fn(async (domain: string) => {
+        calls++;
+        return calls <= healthyScans
+          ? makeScanResult(domain, "A", {})
+          : makeDegradedScanResult(domain);
+      });
+
+      const webhookFn = vi.fn().mockResolvedValue(undefined);
+      const result = await runDueRescans({
+        db: makeD1Mock(),
+        now,
+        scanFn: scanFn as never,
+        fireWebhookFn: webhookFn as never,
+      });
+
+      // No false grades stored, and no grade-drop / protocol-regression alerts
+      // fired off the resolver fault.
+      expect(alerts.size).toBe(0);
+      expect([...history.values()].every((r) => r.grade === "A")).toBe(true);
+      expect(history.size).toBe(healthyScans);
+      expect(result.scanned).toBe(healthyScans);
+
+      // The run stops instead of grinding the remaining ~200 domains through a
+      // resolver that cannot answer.
+      expect(scanFn.mock.calls.length).toBeLessThan(100);
+
+      // Every unverified domain keeps its old grade and stays due.
+      for (let i = healthyScans + 1; i <= 260; i++) {
+        expect(domains.get(i)?.last_grade).toBe("A");
+        expect(domains.get(i)?.last_scanned_at).toBeLessThan(now - weekSeconds);
+      }
+    });
+
+    // A domain whose OWN nameservers are dead (DNS_TIMEOUT / ESERVFAIL) is a
+    // verified finding about that domain, not evidence our resolver is spent.
+    // Deferring it would park it at the head of `ORDER BY last_scanned_at ASC`
+    // forever and — once enough of them cluster there — trip the circuit
+    // breaker before a single healthy domain is scanned.
+    function makeUnreachableScanResult(domain: string) {
+      const timeout = { code: "DNS_TIMEOUT", message: "DNS query timed out" };
+      const base = makeScanResult(domain, "D", {});
+      return {
+        ...base,
+        protocols: {
+          mx: { status: "warn", lookup_error: timeout },
+          dmarc: { status: "warn", lookup_error: timeout },
+          spf: { status: "warn", lookup_error: timeout },
+          dkim: { status: "fail" },
+          bimi: { status: "fail" },
+          mta_sts: { status: "fail" },
+        },
+      };
+    }
+
+    it("permanently-unreachable domains at the head neither halt the run nor stay due forever", async () => {
+      const BROKEN = 20;
+      seedDueDomains(60);
+
+      const scanFn = vi.fn(async (domain: string) => {
+        const id = Number(domain.replace(/\D/g, ""));
+        return id <= BROKEN
+          ? makeUnreachableScanResult(domain)
+          : makeScanResult(domain, "A", {});
+      });
+
+      const result = await runDueRescans({
+        db: makeD1Mock(),
+        now,
+        scanFn: scanFn as never,
+        fireWebhookFn: vi.fn().mockResolvedValue(undefined) as never,
+      });
+
+      // The run is not halted by the broken head.
+      expect(scanFn.mock.calls.length).toBe(60);
+      expect(result.skipped).toBe(0);
+
+      // The broken domains advance: recorded, so last_scanned_at moves and
+      // they stop sorting first on every subsequent run.
+      for (let i = 1; i <= BROKEN; i++) {
+        expect(domains.get(i)?.last_scanned_at).toBe(now);
+      }
+      expect(history.size).toBe(60);
+
+      // But an unverifiable scan still never produces an alert.
+      expect(alerts.size).toBe(0);
+    });
+
+    it("records a domain deferred past the deferral ceiling so it cannot occupy a slot forever", async () => {
+      seedUser();
+      // Deferred so long its data is materially stale: well past cadence plus
+      // the deferral window.
+      domains.set(1, {
+        id: 1,
+        user_id: "u1",
+        domain: "stuck.example",
+        is_free: 1,
+        scan_frequency: "weekly",
+        last_scanned_at: now - weekSeconds - 30 * 24 * 60 * 60,
+        last_grade: "A",
+        created_at: 0,
+      });
+
+      const result = await runDueRescans({
+        db: makeD1Mock(),
+        now,
+        scanFn: vi
+          .fn()
+          .mockResolvedValue(makeDegradedScanResult("stuck.example")) as never,
+        fireWebhookFn: vi.fn().mockResolvedValue(undefined) as never,
+      });
+
+      expect(history.size).toBe(1);
+      expect(domains.get(1)?.last_scanned_at).toBe(now);
+      expect(alerts.size).toBe(0);
+      expect(result.scanned).toBe(1);
+    });
+
+    it("caps a run below the per-invocation subrequest ceiling and defers the rest", async () => {
+      seedDueDomains(260);
+
+      const scanFn = vi.fn(async (domain: string) =>
+        makeScanResult(domain, "A", {}),
+      );
+
+      const result = await runDueRescans({
+        db: makeD1Mock(),
+        now,
+        maxDomainsPerRun: 60,
+        scanFn: scanFn as never,
+        fireWebhookFn: vi.fn().mockResolvedValue(undefined) as never,
+      });
+
+      expect(scanFn.mock.calls.length).toBe(60);
+      expect(result.scanned).toBe(60);
+      expect(result.skipped).toBe(200);
+      // Deferred domains sort first next run (last_scanned_at ASC), so the
+      // portfolio still gets full coverage across consecutive daily runs.
+      expect(domains.get(61)?.last_scanned_at).toBeLessThan(now - weekSeconds);
     });
   });
 });
