@@ -21,7 +21,6 @@ export function parseDnsServers(raw: string | undefined): string[] | null {
   return servers.length > 0 ? servers : null;
 }
 
-const resolver = new dns.promises.Resolver();
 const DNS_TIMEOUT_MS = 3000;
 
 // Local-dev override: `DNS_SERVERS=8.8.8.8,1.1.1.1 npm run dev` points the
@@ -31,12 +30,40 @@ const customDnsServers =
   typeof process !== "undefined"
     ? parseDnsServers(process.env?.DNS_SERVERS)
     : null;
-if (customDnsServers) {
-  try {
-    resolver.setServers(customDnsServers);
-  } catch (err) {
-    console.warn("Failed to apply DNS_SERVERS override:", err);
+
+function createResolver(): dns.promises.Resolver {
+  const r = new dns.promises.Resolver();
+  if (customDnsServers) {
+    try {
+      r.setServers(customDnsServers);
+    } catch (err) {
+      console.warn("Failed to apply DNS_SERVERS override:", err);
+    }
   }
+  return r;
+}
+
+// #700 — a single resolver handle reused for every query across an entire
+// scheduled() cron invocation accumulates queries until the workerd node:dns
+// polyfill's underlying c-ares handle starts returning EBADQUERY for every
+// subsequent query — empirically at a fixed cumulative count around 200 on
+// one handle, well within a single large cron run (hundreds of domains).
+// The interactive /check path never approaches this (one scan issues at most
+// a few dozen queries), so recreating the handle well under that ceiling
+// bounds any one handle's lifetime without affecting single-scan latency —
+// constructing a Resolver does no I/O.
+const RESOLVER_RESET_THRESHOLD = 50;
+
+let resolver = createResolver();
+let queriesSinceReset = 0;
+
+function currentResolver(): dns.promises.Resolver {
+  if (queriesSinceReset >= RESOLVER_RESET_THRESHOLD) {
+    resolver = createResolver();
+    queriesSinceReset = 0;
+  }
+  queriesSinceReset++;
+  return resolver;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -62,7 +89,8 @@ function isDnsAbsent(err: unknown): boolean {
   return false;
 }
 
-function toDnsLookupError(err: unknown): DnsLookupError | null {
+// Exported so callers/tests can assert the classification directly (#700).
+export function toDnsLookupError(err: unknown): DnsLookupError | null {
   if (err instanceof Error && err.message === "DNS timeout") {
     return new DnsLookupError("DNS_TIMEOUT", "DNS query timed out");
   }
@@ -71,6 +99,11 @@ function toDnsLookupError(err: unknown): DnsLookupError | null {
     if (code === "ESERVFAIL") {
       return new DnsLookupError(code, "DNS server failure (SERVFAIL)");
     }
+    // Any other c-ares-level error code (EBADQUERY, ECONNREFUSED, etc.) is a
+    // resolver fault, not a genuinely absent record. Falling through to a bare
+    // throw here is what let a resolver hiccup masquerade as a scored
+    // protocol failure (#700) — classify it the same way as SERVFAIL instead.
+    return new DnsLookupError(code, `DNS resolver error (${code})`);
   }
   return null;
 }
@@ -91,7 +124,7 @@ export async function queryTxt(
   });
   try {
     const records = await withTimeout(
-      resolver.resolveTxt(name),
+      currentResolver().resolveTxt(name),
       DNS_TIMEOUT_MS,
     );
     // workerd's node:dns polyfill may join multi-part TXT chunks with literal
@@ -261,7 +294,10 @@ export async function queryMx(
     level: "info",
   });
   try {
-    const records = await withTimeout(resolver.resolveMx(name), DNS_TIMEOUT_MS);
+    const records = await withTimeout(
+      currentResolver().resolveMx(name),
+      DNS_TIMEOUT_MS,
+    );
     return records.map((r) => ({ priority: r.priority, exchange: r.exchange }));
   } catch (err: unknown) {
     if (isDnsAbsent(err)) {
