@@ -306,7 +306,15 @@ describe("runDueRescans resolver exhaustion regression (#700)", () => {
       });
     }
 
-    const result = await runDueRescans({ db: makeD1Mock(), now });
+    // maxDomainsPerRun is pinned to TOTAL here so this test keeps measuring
+    // what it was written to measure — DNS-layer resolver exhaustion across a
+    // long run — rather than the separate per-invocation domain ceiling added
+    // for #700 (default 150, covered by test/cron-rescan.test.ts).
+    const result = await runDueRescans({
+      db: makeD1Mock(),
+      now,
+      maxDomainsPerRun: TOTAL,
+    });
 
     expect(result.scanned).toBe(TOTAL);
     expect(result.errors).toBe(0);
