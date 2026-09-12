@@ -45,6 +45,11 @@ commit_parsers = [
     # Covers conventional `chore(deps)` / `chore:` and dependabot's raw "Bump X".
     { message = "^chore", skip = true },
     { message = "^[Bb]ump ", skip = true },
+    # Production rollbacks (#657). Deliberately NOT skip = true: a revert
+    # changes what is live, so it must appear in the release notes rather than
+    # falling through to "Other". Matches both the conventional `revert:`
+    # prefix the rollback workflow writes and git's default `Revert "..."`.
+    { message = "^[Rr]evert", group = "Reverted" },
     { body = ".*", group = "Other" },
 ]
 filter_commits = false

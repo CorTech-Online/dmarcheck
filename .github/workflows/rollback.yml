@@ -1,0 +1,406 @@
+name: Rollback
+
+# The production revert path (#657).
+#
+# Production deploys leave GitHub entirely: a merge to `main` is picked up by
+# the Cloudflare Git integration (Workers Builds), so no Actions run owns the
+# deploy, there is no job to re-run and no artifact to roll back to.
+# `prod-smoke.yml` can DETECT a bad deploy but cannot undo one. This workflow
+# is the undo.
+#
+# It offers three actions, deliberately ordered fastest-first:
+#
+#   inspect        (default, READ-ONLY) — what is live right now, and which
+#                  versions are eligible to roll back to. Always run this
+#                  first; the version ids it prints are the input to the next
+#                  step.
+#
+#   pin-version    (SECONDS, no PR, no review) — `wrangler rollback` shifts
+#                  100% of traffic to a previously-uploaded Worker version.
+#                  This is the emergency lever. It touches no git history and
+#                  is therefore subject to no branch protection, no required
+#                  check and no CODEOWNERS review.
+#
+#   revert-commit  (MINUTES, needs a PR) — opens a `revert:` PR against main.
+#                  This is the DURABLE half: a version pin is undone by the
+#                  very next push to main, because that push triggers a fresh
+#                  Git-integration deploy which becomes the active version.
+#                  Until the revert lands, main still contains the bad code.
+#
+# The two are complements, not alternatives. Real incident order is
+# inspect → pin-version (stop the bleeding) → revert-commit (make it stick).
+# See docs/rollback.md for the full runbook and its preconditions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to do (start with inspect)"
+        type: choice
+        required: true
+        default: inspect
+        options:
+          - inspect
+          - pin-version
+          - revert-commit
+      version_id:
+        description: "pin-version: Worker version UUID from inspect. Blank = the version uploaded before the current one."
+        type: string
+        required: false
+        default: ""
+      commit:
+        description: "revert-commit: the SHA on main to revert (7-40 hex chars)."
+        type: string
+        required: false
+        default: ""
+      reason:
+        description: "Why we are rolling back. Recorded in the Cloudflare deployment message and the PR body."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# One rollback at a time. Never cancel one in flight — a half-applied traffic
+# shift is worse than a queued one.
+concurrency:
+  group: rollback
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # READ-ONLY. Safe to run at any time, including as the first step of a drill.
+  # ---------------------------------------------------------------------------
+  inspect:
+    if: ${{ inputs.action == 'inspect' || inputs.action == 'pin-version' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+
+      # Fail fast and legibly rather than letting wrangler emit a generic auth
+      # error five steps later, mid-incident.
+      - name: Check Cloudflare credentials are present
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID are not set. The token needs Workers Scripts:Edit on the account that owns this Worker. Use the git revert path (action: revert-commit) until they are configured."
+            exit 1
+          fi
+
+      - name: Show the active deployment
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Active deployment"
+            echo ""
+            echo '```'
+            npx wrangler deployments status 2>&1 || echo "(wrangler deployments status failed — see the step log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # `wrangler versions list` returns the 10 most recent versions. Cloudflare
+      # retains the last 100 for rollback purposes; if the version you need is
+      # older than the 10 shown, fetch it from the Cloudflare dashboard
+      # (Workers & Pages -> this Worker -> Deployments).
+      - name: List rollback candidates
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler versions list --json > versions.json 2>/dev/null || {
+            echo "::warning::--json listing failed; falling back to human-readable output."
+            {
+              echo "## Recent versions"
+              echo ""
+              echo '```'
+              npx wrangler versions list 2>&1 || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          {
+            echo "## Rollback candidates (10 most recent)"
+            echo ""
+            echo "| Version ID | Created | Author | Source |"
+            echo "|---|---|---|---|"
+            jq -r '.[] | "| `\(.id)` | \(.metadata.created_on // "?") | \(.metadata.author_email // "?") | \(.metadata.source // "?") |"' versions.json \
+              || echo "| (unexpected \`versions list --json\` shape — see step log) | | | |"
+            echo ""
+            echo "Re-run this workflow with **action: pin-version** and the chosen Version ID."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # MUTATES PRODUCTION TRAFFIC. No PR, no review — that is the point.
+  # ---------------------------------------------------------------------------
+  pin-version:
+    if: ${{ inputs.action == 'pin-version' }}
+    needs: inspect
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # gh workflow run prod-smoke.yml — verifies the rollback actually landed.
+      actions: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+
+      # Every dispatch input reaches the shell through the environment, never
+      # through `${{ }}` interpolation into a run body: `reason` is free text
+      # typed into a web form by a human under stress, and this job holds a
+      # Cloudflare deploy token.
+      - name: Validate version_id
+        env:
+          VERSION_ID: ${{ inputs.version_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "${VERSION_ID:-}" ] && ! printf '%s' "$VERSION_ID" | grep -qE '^[0-9a-f-]{36}$'; then
+            echo "::error::version_id must be a Worker version UUID (36 chars, hex and dashes) or blank. Got a value that does not match."
+            exit 1
+          fi
+
+      - name: Roll traffic back
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERSION_ID: ${{ inputs.version_id }}
+          REASON: ${{ inputs.reason }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # --message is what makes `wrangler rollback` non-interactive; without
+          # it the command waits on a TTY prompt that never comes and the job
+          # burns its timeout doing nothing.
+          ROLLBACK_MESSAGE="Rollback by ${ACTOR}: ${REASON} (${RUN_URL})"
+          if [ -n "${VERSION_ID:-}" ]; then
+            echo "Rolling back to version $VERSION_ID"
+            npx wrangler rollback "$VERSION_ID" --message "$ROLLBACK_MESSAGE"
+          else
+            echo "No version_id given — rolling back to the version uploaded before the current one."
+            npx wrangler rollback --message "$ROLLBACK_MESSAGE"
+          fi
+
+      - name: Record the new active deployment
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Traffic rolled back"
+            echo ""
+            echo '```'
+            npx wrangler deployments status 2>&1 || true
+            echo '```'
+            echo ""
+            echo "> **This is temporary.** The next push to \`main\` triggers a fresh"
+            echo "> Cloudflare Git-integration deploy, which supersedes this pin and"
+            echo "> puts the bad code back. Land the \`revert:\` PR before anything"
+            echo "> else merges — re-run this workflow with **action: revert-commit**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Close the loop: prove the rollback actually fixed the live surface
+      # rather than assuming it did. workflow_dispatch is one of the two events
+      # GITHUB_TOKEN is still allowed to trigger, so this really does start a run.
+      - name: Trigger prod smoke against the rolled-back deploy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh workflow run prod-smoke.yml \
+            || echo "::warning::Could not trigger prod-smoke automatically — run it manually to confirm the rollback."
+
+  # ---------------------------------------------------------------------------
+  # Opens the durable revert PR. Does not itself write to main: `main-protection`
+  # requires a PR and has an empty bypass_actors list, so nothing — including
+  # this workflow — can push to main directly.
+  # ---------------------------------------------------------------------------
+  revert-commit:
+    if: ${{ inputs.action == 'revert-commit' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Validate commit SHA
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$COMMIT" | grep -qE '^[0-9a-f]{7,40}$'; then
+            echo "::error::commit must be a 7-40 character lowercase hex SHA. Refusing to pass unvalidated input to git."
+            exit 1
+          fi
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: main
+          # Prefer the factory identity when it exists. This matters beyond
+          # authorship: a PR opened with GITHUB_TOKEN does NOT trigger
+          # `pull_request` workflows, so CI never runs on it and the required
+          # `check` context never reports — leaving the revert PR permanently
+          # unmergeable. A PAT-opened PR triggers CI normally. Until the
+          # bot-identity split lands, the fallback path works but needs one
+          # manual nudge (close + reopen the PR); the summary below says so.
+          token: ${{ secrets.FACTORY_GH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Create the revert branch
+        id: revert
+        env:
+          COMMIT: ${{ inputs.commit }}
+          REASON: ${{ inputs.reason }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Resolve and confirm the target is actually on main. Reverting a SHA
+          # that never shipped would produce a nonsense diff.
+          FULL_SHA=$(git rev-parse --verify "${COMMIT}^{commit}")
+          if ! git merge-base --is-ancestor "$FULL_SHA" origin/main; then
+            echo "::error::$FULL_SHA is not an ancestor of origin/main — nothing to roll back."
+            exit 1
+          fi
+
+          SUBJECT=$(git log -1 --format=%s "$FULL_SHA")
+          SHORT_SHA=$(git rev-parse --short "$FULL_SHA")
+          BRANCH="rollback/revert-${SHORT_SHA}-${RUN_ID}"
+
+          # Author as the bot so the DCO workflow's provenance exemption applies
+          # (it skips authors whose name contains "[bot]"). A human-authored
+          # revert would need a Signed-off-by trailer this job cannot honestly
+          # produce on someone else's behalf.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+          # main enforces linear history, so commits here are single-parent.
+          # Handle a merge commit anyway rather than failing obscurely.
+          PARENT_COUNT=$(( $(git rev-list --parents -n 1 "$FULL_SHA" | wc -w) - 1 ))
+          if [ "$PARENT_COUNT" -gt 1 ]; then
+            git revert --no-commit -m 1 "$FULL_SHA"
+          else
+            git revert --no-commit "$FULL_SHA"
+          fi || {
+            echo "::error::git revert hit a conflict — $FULL_SHA cannot be reverted cleanly by machine. Roll back traffic with action: pin-version, then craft the revert by hand."
+            git revert --abort 2>/dev/null || true
+            exit 1
+          }
+
+          # printf with %s keeps the untrusted subject/reason as arguments, never
+          # as a format string.
+          {
+            printf 'revert: %s\n\n' "$SUBJECT"
+            printf 'This reverts commit %s.\n\n' "$FULL_SHA"
+            printf 'Reason: %s\n' "$REASON"
+            printf 'Rolled back by: %s\n' "$ACTOR"
+            printf 'Workflow run: %s\n' "$RUN_URL"
+          } > "$RUNNER_TEMP/revert-msg.txt"
+
+          git commit -F "$RUNNER_TEMP/revert-msg.txt"
+          git push origin "$BRANCH"
+
+          {
+            echo "branch=$BRANCH"
+            echo "full_sha=$FULL_SHA"
+            echo "short_sha=$SHORT_SHA"
+            echo "subject=$SUBJECT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open the revert PR
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_GH_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HAS_PAT: ${{ secrets.FACTORY_GH_TOKEN != '' }}
+          BRANCH: ${{ steps.revert.outputs.branch }}
+          FULL_SHA: ${{ steps.revert.outputs.full_sha }}
+          SHORT_SHA: ${{ steps.revert.outputs.short_sha }}
+          SUBJECT: ${{ steps.revert.outputs.subject }}
+          REASON: ${{ inputs.reason }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Idempotent label creation, same pattern as prod-smoke.yml — avoids
+          # hard-coupling this workflow to a one-time manual setup step.
+          gh label create rollback --color "b60205" \
+            --description "Reverts a change that reached production" 2>/dev/null || true
+
+          {
+            printf 'Rolls back `%s` — %s\n\n' "$SHORT_SHA" "$SUBJECT"
+            printf '**Reason:** %s\n\n' "$REASON"
+            printf 'Requested by @%s via the Rollback workflow (%s).\n\n' "$ACTOR" "$RUN_URL"
+            printf -- '---\n\n'
+            printf 'Reverts %s in full. Merging this makes the rollback durable: until it\n' "$FULL_SHA"
+            printf 'lands, `main` still contains the reverted change and the next\n'
+            printf 'Git-integration deploy will put it back in production.\n'
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          if [ "$HAS_PAT" != "true" ]; then
+            {
+              printf '\n> [!IMPORTANT]\n'
+              printf '> This PR was opened with `GITHUB_TOKEN`, so GitHub suppressed the\n'
+              printf '> `pull_request` event and **CI did not start**. The required `check`\n'
+              printf '> context will never report and the PR cannot merge as-is.\n'
+              printf '> Close and immediately reopen this PR to trigger CI.\n'
+            } >> "$RUNNER_TEMP/pr-body.md"
+          fi
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "revert: ${SUBJECT}" \
+            --body-file "$RUNNER_TEMP/pr-body.md" \
+            --label rollback
+
+          PR_URL=$(gh pr view "$BRANCH" --json url --jq .url)
+
+          # Squash only: main requires linear history and merge commits are
+          # disabled at the repo level. Auto-merge is best-effort — it will not
+          # fire while CI is absent, nor while a code owner review is pending if
+          # the reverted change touched a CODEOWNERS path.
+          gh pr merge "$BRANCH" --auto --squash \
+            || echo "::warning::Could not enable auto-merge; merge the PR manually once checks are green."
+
+          {
+            echo "## Revert PR opened"
+            echo ""
+            echo "$PR_URL"
+            echo ""
+            echo "Reverts \`$SHORT_SHA\` — $SUBJECT"
+            echo ""
+            if [ "$HAS_PAT" != "true" ]; then
+              echo "> [!IMPORTANT]"
+              echo "> Opened with \`GITHUB_TOKEN\`, so CI did **not** start automatically."
+              echo "> Close and reopen the PR to trigger the required \`check\` run."
+            fi
+            echo ""
+            echo "If the reverted change touched a path in \`.github/CODEOWNERS\`, this PR"
+            echo "also needs a code-owner approval. That gate is intentional — use"
+            echo "**action: pin-version** to stop the bleeding while review happens."
+          } >> "$GITHUB_STEP_SUMMARY"

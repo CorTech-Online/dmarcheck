@@ -119,6 +119,16 @@ Database migration rules: see [src/db/CLAUDE.md](src/db/CLAUDE.md)
 - GitHub Releases page is the project changelog
 - Tags are created automatically; do not create manual tags
 
+## Rollback
+
+- `.github/workflows/rollback.yml` (#657) is the production revert path. Deploys go out via the Cloudflare Git integration with no Actions job owning them, so there is nothing to re-run — this workflow is the only undo. Full runbook: `docs/rollback.md`
+- Three `workflow_dispatch` actions: **`inspect`** (read-only; lists the active deployment and rollback candidates), **`pin-version`** (`wrangler rollback` — shifts traffic to a previous Worker version in seconds, no PR, no review), **`revert-commit`** (opens the `revert:` PR). `inspect` is the default so a mis-click cannot move traffic
+- **`pin-version` is temporary.** The next push to `main` redeploys from git and supersedes the pin. Treat `main` as frozen until the revert PR lands
+- A code rollback does **not** undo D1 schema, KV/DO data, bindings, or secrets. It is safe against schema only because migrations are additive-only (`scripts/migration-lint/`, see `src/db/CLAUDE.md`); a destructive migration through the escape hatch breaks that assumption
+- **No CODEOWNERS exemption accompanies this**, deliberately — CODEOWNERS matches the paths in a PR's diff, and a revert PR's diff is whatever the reverted commit touched, so no path rule can exempt "reverts". `.factory/gate.json`'s denylist is already a superset of CODEOWNERS, so anything the factory can auto-merge is outside every code-owned path and so is its revert. Reasoning in full in `docs/rollback.md`; do not "fix" this by un-owning the workflow, which holds `contents: write` and the Cloudflare deploy token
+- Every dispatch input reaches the shell through `env:`, never `${{ }}` interpolation into a `run:` body — `test/rollback-workflow.test.ts` fails the build if that regresses, along with SHA-pinning, the least-privilege `permissions:` block, and hardcoded repo slugs (the #679 rename trap)
+- A revert commit **is** releasable and cuts a CalVer tag on purpose (the Releases page is the changelog, and a rollback changes what is live). `cliff.toml` groups it under **Reverted**; `scripts/release/__tests__/releasable.test.ts` pins both
+
 ## GitHub Issues
 
 - After committing or merging work, check open issues (`gh issue list`) to see if any were resolved and should be closed

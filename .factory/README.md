@@ -22,9 +22,12 @@ anything today** and that is deliberate. Three independent things still gate it:
    @schmug**. GitHub forbids self-approval, so a token acting as the code owner can never satisfy
    the `require_code_owner_review` rule on `main-protection`. Until that identity exists the
    `advance` and `land` jobs cannot run.
-3. **There is no rollback lever.** Production deploys currently leave GitHub entirely via the
-   Cloudflare Git integration, so a bad auto-merged change cannot be reverted from here. A factory
-   without a revert path is not a factory.
+3. **The rollback lever is built but undrilled.** `.github/workflows/rollback.yml` (#657) gives
+   production a revert path from GitHub: `pin-version` shifts traffic back to a previous Worker
+   version in seconds with no PR and no review, and `revert-commit` opens the `revert:` PR that
+   makes it durable. Runbook: [docs/rollback.md](../docs/rollback.md). **It has not yet been
+   exercised against production**, and an untested rollback lever is not a rollback lever — run
+   the drill in the runbook and record it on #657 before treating this blocker as cleared.
 
 Do not raise `allowlistAuthors` off a reviewed list, and do not set `requireFixtureEvidence: true`,
 until those are resolved.

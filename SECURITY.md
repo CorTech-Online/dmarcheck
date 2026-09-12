@@ -65,6 +65,27 @@ dmarcheck is a rolling release deployed continuously from `main`. There are
 no long-lived branches or LTS versions. The only supported version is the
 current contents of `main` / the deployed Worker.
 
+## Rolling back a bad deploy
+
+Because deploys go out through the Cloudflare Git integration rather than a
+GitHub Actions job, there is no deployment to re-run and no artifact to
+redeploy. The revert path is the **Rollback** workflow
+([.github/workflows/rollback.yml](.github/workflows/rollback.yml)), run from
+Actions → Rollback → Run workflow by anyone with write access:
+
+- **`pin-version`** shifts production traffic back to a previously-uploaded
+  Worker version in seconds, with no PR and no review. This is the lever to
+  pull first when the live service is broken — including when the break is a
+  security regression.
+- **`revert-commit`** opens the `revert:` PR that makes it durable. A version
+  pin is superseded by the next push to `main`, so the revert must land before
+  anything else merges.
+
+A code rollback does **not** roll back D1 schema, KV/Durable Object data, or
+bindings. Read [docs/rollback.md](docs/rollback.md) before using it — it
+documents the preconditions, the failure modes, and why no CODEOWNERS
+exemption accompanies it.
+
 ## Vulnerability management
 
 We run automated software-composition analysis (SCA) and static analysis (SAST)

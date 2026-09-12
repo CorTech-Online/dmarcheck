@@ -59,6 +59,26 @@ describe("isReleasable", () => {
   });
 });
 
+// A rollback (#657) lands a revert commit on main, which triggers Release like
+// any other push. That it cuts a CalVer tag is DELIBERATE, not an oversight:
+// the GitHub Releases page is this project's changelog, and a rollback changes
+// what is running in production. Suppressing the tag would leave the changelog
+// asserting that the reverted code is still live. These tests pin that choice
+// so nobody "fixes" it into a skip pattern later without reading this comment.
+describe("revert commits (rollback lever, #657)", () => {
+  it("treats a conventional 'revert:' commit as releasable", () => {
+    expect(isReleasable(["revert: feat: add SPF strict mode (rollback of abc1234)"])).toBe(true);
+  });
+
+  it("treats git's default 'Revert \"...\"' subject as releasable", () => {
+    expect(isReleasable(['Revert "feat: add SPF strict mode"'])).toBe(true);
+  });
+
+  it("stays releasable when the revert is batched with skippable chores", () => {
+    expect(isReleasable(["chore(deps): bump vitest", "revert: bad analyzer change"])).toBe(true);
+  });
+});
+
 describe("sanitizeLastTag", () => {
   it("passes through CalVer tags unchanged", () => {
     expect(sanitizeLastTag("v2026.4.1")).toBe("v2026.4.1");
@@ -106,5 +126,24 @@ describe("cliff.toml sync", () => {
     }
     const ourPatterns = new Set<string>(SKIP_PATTERN_SOURCES);
     expect(ourPatterns).toEqual(cliffSkip);
+  });
+
+  // Reverts are releasable (see above), so they WILL appear in release notes.
+  // Without a parser of their own they fall through to the `body = ".*"`
+  // catch-all and land under "Other" — a rollback is the single most
+  // important line a changelog can carry, so it gets its own group.
+  it("groups revert commits under 'Reverted' ahead of the catch-all parser", () => {
+    const tomlLines = readFileSync(resolve(process.cwd(), "cliff.toml"), "utf8").split("\n");
+
+    const revertIdx = tomlLines.findIndex(
+      (l) => /message = "\^\[Rr\]evert"/.test(l) && /group = "Reverted"/.test(l),
+    );
+    const catchAllIdx = tomlLines.findIndex((l) => /body = "\.\*"/.test(l));
+
+    expect(revertIdx).toBeGreaterThan(-1);
+    expect(catchAllIdx).toBeGreaterThan(-1);
+    expect(revertIdx).toBeLessThan(catchAllIdx);
+    // Must not be skip = true, or the rollback would silently stop releasing.
+    expect(tomlLines[revertIdx]).not.toMatch(/skip = true/);
   });
 });
