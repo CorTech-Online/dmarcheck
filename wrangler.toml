@@ -8,6 +8,36 @@ routes = [
   { pattern = "dmarc.mx", custom_domain = true },
 ]
 
+# Workers Logs + Workers Traces (Cloudflare: "Production Workers without
+# observability are a black box"). Sentry already captures exceptions and
+# transactions, but it does not emit per-binding operation traces — which D1
+# query in a request failed, how long a KV read took, whether a Durable Object
+# RPC round-tripped. That is the signal the cron-degradation class of bug
+# (#700 / #702) was hardest to diagnose without.
+#
+# The top-level `enabled` flag does NOT turn on traces: `observability.traces`
+# has its own `enabled` key and must be set explicitly. Keep both.
+#
+# Top-level block only — NEVER add an [env.<name>] observability block here
+# (an [env.*] block detached dmarc.mx on 2026-04-26, PRs #203 → #206).
+#
+# Must stay BELOW `routes`: in TOML every bare key after a [table] header
+# belongs to that table, so hoisting this block above `routes` silently
+# swallows the custom-domain route into [observability.traces].
+[observability]
+enabled = true
+
+  # Sample every log line; volume at dmarc.mx's scale is well inside the
+  # included allowance.
+  [observability.logs]
+  head_sampling_rate = 1
+
+  # Traces are far heavier per event than logs, so sample 1%. Enough to
+  # characterise a slow or failing cron run without paying for every request.
+  [observability.traces]
+  enabled = true
+  head_sampling_rate = 0.01
+
 [dev]
 port = 8790
 

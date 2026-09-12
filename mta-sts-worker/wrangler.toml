@@ -5,3 +5,20 @@ compatibility_date = "2025-03-30"
 routes = [
   { pattern = "mta-sts.dmarc.mx", custom_domain = true },
 ]
+
+# Workers Logs + Workers Traces. `observability.traces.enabled` is a separate
+# setting — the top-level flag alone does not enable traces.
+#
+# Top-level block only — never add an [env.<name>] block to a wrangler.toml in
+# this repo (see the note in the root config).
+[observability]
+enabled = true
+
+  [observability.logs]
+  head_sampling_rate = 1
+
+  # This Worker serves one static policy file, so the trace volume is tiny —
+  # 10% sampling costs little and gives a usable picture of the MTA-STS path.
+  [observability.traces]
+  enabled = true
+  head_sampling_rate = 0.1

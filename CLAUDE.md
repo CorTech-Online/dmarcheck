@@ -77,6 +77,13 @@ Live at dmarc.mx | Repo: github.com/schmug/dmarcheck
 - Name appears in footer ("Guarded by DMarcus"), loading text, aria labels, and README
 - **Social preview / OG image:** `scripts/generate-icons.mjs` rasterizes the OG SVG into `OG_IMAGE_PNG_BASE64` (served at `/og-image.png`, referenced by `og:image` / `twitter:image`) and writes `docs/github-social-preview.png` (1280×640). When the OG design changes, re-run the script, paste the new base64 into `src/views/favicon.ts`, commit the regenerated PNG, and re-upload it at GitHub → Settings → General → Social preview (that field has no API).
 
+## Observability
+
+- Both `wrangler.toml` and `mta-sts-worker/wrangler.toml` carry a top-level `[observability]` block enabling Workers Logs (`logs.head_sampling_rate = 1`) and Workers Traces (`traces.head_sampling_rate` 0.01 root / 0.1 mta-sts). **`observability.traces.enabled` is a separate setting — the top-level `enabled = true` does not turn traces on**; keep both explicit
+- The root block must stay **below** the `routes = [...]` array. TOML assigns every bare key following a `[table]` header to that table, so hoisting `[observability]` above `routes` silently swallows the custom-domain route into `[observability.traces]` (wrangler warns `Unexpected fields found in observability field: "routes"`)
+- Top-level only, as everywhere else in these configs — never an `[env.<name>].observability` block (see the 2026-04-26 detachment, PRs #203 → #206)
+- Additive to Sentry, not a replacement: Sentry captures exceptions and transactions, Workers Traces adds per-binding operation spans (which D1 query failed, how long a KV read took, whether a DO RPC round-tripped) — the signal the #700 / #702 cron degradation was hardest to diagnose without
+
 ## Quality Gates
 
 - Biome handles linting and formatting (`biome.json`)
