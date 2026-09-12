@@ -52,15 +52,21 @@ ACCESS_TEAM_DOMAIN = "coryrankin.cloudflareaccess.com"
 # src/cron/rescan.ts is the workaround for that ceiling; this raises the
 # ceiling itself (Paid allows up to 10M).
 #
-# UNVERIFIED PREMISE: Cloudflare documents [limits] as "only supported for the
-# Standard Usage Model". Workers Paid is certain (a single scan issues up to
-# 150 DNS queries and Free caps at 50, yet dmarc.mx works), but Paid does not
-# imply Standard — on a legacy Bundled or Unbound model this block is silently
-# inert. Inert is safe on its own; it cannot make anything worse. What is NOT
-# safe is raising MAX_DOMAINS_PER_RUN while this is inert — that reproduces
-# #700 exactly. Confirm the ceiling actually moved first, by watching the
-# cron.skipped Sentry tag (set in src/index.ts) fall toward zero across live
-# cron runs.
+# USAGE-MODEL PREMISE: Cloudflare documents [limits] as "only supported for the
+# Standard Usage Model". A dashboard check on 2026-09-11 (Workers plans page,
+# account f0fc4ca5b74274f7ba892e6c9ec411a7) found Paid advertising "Up to 5 min
+# CPU time per request" — the Standard signature (legacy Bundled was 10 ms,
+# Unbound 30 s). That is strong but INDIRECT: an inference from a plan-page
+# string, not a literal usage-model readout, and it cannot be re-checked from
+# this repo. Treat the ceiling as probably-raised, not proven-raised. On a
+# legacy Bundled or Unbound model this block is accepted by Wrangler and then
+# silently inert — no error, no warning, no deploy-time signal.
+#
+# Inert is safe on its own; it cannot make anything worse. What is NOT safe is
+# raising MAX_DOMAINS_PER_RUN while this is inert — that reproduces #700
+# exactly (147 domains false-graded D/F in one run). Confirm the ceiling
+# actually moved first, by watching the cron.skipped Sentry tag (set in
+# src/index.ts) fall toward zero across live cron runs.
 #
 # This is NOT the per-scan DNS budget. That is ScanBudget / DEFAULT_SCAN_LIMITS
 # in src/dns/scan-budget.ts, a security control (GHSA-f828-8wf8-vqp2) bounding
