@@ -9,7 +9,6 @@ dist/
 docs/internal/
 pnpm-lock.yaml
 .jules/
-.claude/
 
 # Security-scan artifacts (vuln-scan / vuln-triage). Point-in-time findings —
 # never commit on a public repo: a list of live unpatched bugs is an attacker
