@@ -122,8 +122,17 @@ async function fetchPolicy(domain: string): Promise<MtaStsPolicy | null> {
     // `resp.type` is cast to string because @cloudflare/workers-types narrows
     // it to `"default" | "error"`, even though the runtime also emits
     // `"opaqueredirect"` when a 3xx is encountered under `redirect: "manual"`.
-    if ((resp.type as string) === "opaqueredirect") return null;
-    if (!resp.ok) return null;
+    if ((resp.type as string) === "opaqueredirect") {
+      // Free the discarded body per Cloudflare's fetch() guidance; `.catch`
+      // keeps a rejected cancel() from becoming an unhandled rejection since
+      // this function's contract is to return null, never throw.
+      resp.body?.cancel().catch(() => {});
+      return null;
+    }
+    if (!resp.ok) {
+      resp.body?.cancel().catch(() => {});
+      return null;
+    }
 
     // Bound the body before decoding — reading via arrayBuffer()+slice caps
     // memory regardless of a lying Content-Length or a slow infinite stream

@@ -84,7 +84,13 @@ async function fetchSecurityTxt(url: string): Promise<string | null> {
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      // Free the discarded body per Cloudflare's fetch() guidance; `.catch`
+      // keeps a rejected cancel() from becoming an unhandled rejection since
+      // this function's contract is to return null, never throw.
+      resp.body?.cancel().catch(() => {});
+      return null;
+    }
 
     // Cap the body size before we decode it — saves both memory and the
     // cost of running the parser over a runaway response.

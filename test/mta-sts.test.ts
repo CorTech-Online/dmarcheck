@@ -306,4 +306,39 @@ describe("analyzeMtaSts", () => {
       ),
     ).toBe(true);
   });
+
+  // #716 — discarded response bodies on the opaque-redirect and !resp.ok
+  // early returns should be cancelled per Cloudflare's fetch() guidance.
+  it("cancels the response body on an opaque-redirect response", async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    mockQueryTxt.mockResolvedValue({
+      entries: ["v=STSv1; id=20240101"],
+      raw: "v=STSv1; id=20240101",
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      type: "opaqueredirect",
+      body: { cancel },
+    } as unknown as Response);
+
+    await analyzeMtaSts("example.com");
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels the response body on a non-ok response without throwing when cancel() rejects", async () => {
+    const cancel = vi.fn().mockRejectedValue(new Error("already cancelled"));
+    mockQueryTxt.mockResolvedValue({
+      entries: ["v=STSv1; id=20240101"],
+      raw: "v=STSv1; id=20240101",
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      type: "default",
+      body: { cancel },
+    } as unknown as Response);
+
+    const result = await analyzeMtaSts("example.com");
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(result.policy).toBeNull();
+  });
 });

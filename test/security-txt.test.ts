@@ -246,4 +246,23 @@ iQE... (snip)
     expect(result.status).toBe("info");
     expect(result.fields).toBeNull();
   });
+
+  // #716 — a discarded non-ok response body should be cancelled per
+  // Cloudflare's fetch() guidance, without a rejected cancel() propagating.
+  it("cancels the response body on a non-ok response without throwing when cancel() rejects", async () => {
+    const cancel = vi.fn().mockRejectedValue(new Error("already cancelled"));
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () =>
+        ({
+          ok: false,
+          type: "default",
+          body: { cancel },
+        }) as unknown as Response,
+    );
+
+    const result = await analyzeSecurityTxt("example.com");
+    // Called once per fetch attempt: well-known, then the /security.txt fallback.
+    expect(cancel).toHaveBeenCalledTimes(2);
+    expect(result.fields).toBeNull();
+  });
 });
