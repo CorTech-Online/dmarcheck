@@ -1,5 +1,6 @@
 import dns from "node:dns";
 import * as Sentry from "@sentry/cloudflare";
+import * as dnsPacket from "dns-packet";
 import { DnsLookupError } from "./errors.js";
 // Type-only: enforcement is a runtime `budget?.consume()` call, so no value
 // import of scan-budget.ts is emitted here.
@@ -209,102 +210,20 @@ export async function queryDoh(
   }
 }
 
-// DNS header flags for a minimal standard query: QR=0 (query), Opcode=0,
-// RD=1 (recursion desired) — the only bit a resolver needs set to answer.
-const DNS_QUERY_FLAGS = 0x0100;
-
-// Encodes a single-question, type-A DNS query into RFC 1035 wire format so it
-// can travel as an RFC 8484 DoH POST body instead of a GET query string.
-// Only queryDnsbl needs this: its query name embeds a secret DQS key, and a
-// GET's URL would put that key in `url.full`/`url.query` — which Workers
-// Traces spans record automatically with no scrubbing hook (#728). This is a
-// small, fixed encoder for exactly this shape (no compression, no EDNS,
-// QTYPE hardcoded to A) — not a general DNS library.
-function encodeDnsQueryA(name: string): Uint8Array {
-  const encoder = new TextEncoder();
-  const qname: number[] = [];
-  for (const label of name.split(".")) {
-    if (label.length === 0) continue;
-    const bytes = encoder.encode(label);
-    if (bytes.length > 63) {
-      throw new Error("DNS label exceeds 63 octets");
-    }
-    qname.push(bytes.length, ...bytes);
-  }
-  qname.push(0); // root label terminator
-
-  return new Uint8Array([
-    0x00,
-    0x00, // ID — unused; DoH is one request/response over HTTP, nothing to
-    // disambiguate the way multiplexed queries on one socket would need.
-    (DNS_QUERY_FLAGS >> 8) & 0xff,
-    DNS_QUERY_FLAGS & 0xff,
-    0x00,
-    0x01, // QDCOUNT = 1
-    0x00,
-    0x00, // ANCOUNT = 0
-    0x00,
-    0x00, // NSCOUNT = 0
-    0x00,
-    0x00, // ARCOUNT = 0
-    ...qname,
-    0x00,
-    0x01, // QTYPE = A
-    0x00,
-    0x01, // QCLASS = IN
-  ]);
+// dns-packet's community type definitions omit the decoded header's `rcode`
+// string (e.g. "NXDOMAIN") even though the library always sets it at
+// runtime (see rcodes.js's toString mapping) — this extends the declared
+// Packet type to match actual decode() output instead of casting to `any`.
+interface DecodedDnsPacket extends dnsPacket.Packet {
+  rcode: string;
 }
 
-// Skips one (possibly compressed) NAME field in a wire-format DNS message,
-// returning the offset just past it. A compression pointer (top two bits of
-// the length byte set) is always exactly two bytes; the decoder never needs
-// to follow it because it only reads what comes AFTER each name, never the
-// name itself.
-function skipDnsName(buf: Uint8Array, offset: number): number {
-  while (offset < buf.length) {
-    const len = buf[offset];
-    if (len === 0) return offset + 1;
-    if ((len & 0xc0) === 0xc0) return offset + 2;
-    offset += 1 + len;
-  }
-  return offset;
-}
-
-// Decodes just enough of an RFC 1035 wire-format response to answer a type-A
-// DNSBL query: the RCODE (for NXDOMAIN detection, mirroring DohResponse.Status
-// from the JSON API) and any A-record RDATA.
-function decodeDnsResponseA(buf: Uint8Array): {
-  rcode: number;
-  aRecords: string[];
-} {
-  if (buf.length < 12) {
-    throw new Error("DNS response shorter than header");
-  }
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const rcode = view.getUint16(2) & 0x0f;
-  const qdcount = view.getUint16(4);
-  const ancount = view.getUint16(6);
-
-  let offset = 12;
-  for (let i = 0; i < qdcount; i++) {
-    offset = skipDnsName(buf, offset) + 4; // + QTYPE + QCLASS
-  }
-
-  const aRecords: string[] = [];
-  for (let i = 0; i < ancount; i++) {
-    offset = skipDnsName(buf, offset);
-    const type = view.getUint16(offset);
-    const rdlength = view.getUint16(offset + 8);
-    const rdataOffset = offset + 10;
-    if (type === 1 && rdlength === 4) {
-      aRecords.push(
-        `${buf[rdataOffset]}.${buf[rdataOffset + 1]}.${buf[rdataOffset + 2]}.${buf[rdataOffset + 3]}`,
-      );
-    }
-    offset = rdataOffset + rdlength;
-  }
-
-  return { rcode, aRecords };
+// dns-packet types every A/AAAA/CNAME/.../PTR answer under one
+// `StringRecordType` union rather than a per-type literal, so `type: "A"`
+// alone doesn't narrow `Answer` to a type with a `data: string` field — this
+// says exactly what queryDnsbl actually reads off a type-A answer.
+interface ARecordAnswer extends dnsPacket.GenericAnswer<"A"> {
+  data: string;
 }
 
 // DNSBL/RBL lookup — RFC 8484 DoH POST with a wire-format body (RFC 1035),
@@ -345,7 +264,12 @@ export async function queryDnsbl(
           "Content-Type": "application/dns-message",
           Accept: "application/dns-message",
         },
-        body: encodeDnsQueryA(name),
+        body: dnsPacket.encode({
+          type: "query",
+          id: 0,
+          flags: dnsPacket.RECURSION_DESIRED,
+          questions: [{ type: "A", name }],
+        }),
         redirect: "follow",
       }),
       DNS_TIMEOUT_MS,
@@ -356,10 +280,13 @@ export async function queryDnsbl(
         `DNSBL query returned HTTP ${resp.status}`,
       );
     }
-    const { rcode, aRecords } = decodeDnsResponseA(
-      new Uint8Array(await resp.arrayBuffer()),
-    );
-    if (rcode === 3 || aRecords.length === 0) {
+    const packet = dnsPacket.decode(
+      Buffer.from(await resp.arrayBuffer()),
+    ) as DecodedDnsPacket;
+    const aRecords = (packet.answers ?? [])
+      .filter((a): a is ARecordAnswer => a.type === "A")
+      .map((a) => a.data);
+    if (packet.rcode === "NXDOMAIN" || aRecords.length === 0) {
       return null;
     }
     return aRecords;

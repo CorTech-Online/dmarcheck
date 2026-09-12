@@ -19,6 +19,7 @@
     "@cloudflare/workers-types": "^4.20260611.1",
     "@emnapi/core": "^1.11.1",
     "@emnapi/runtime": "^1.11.1",
+    "@types/dns-packet": "^5.6.1",
     "@types/node": "^26.1.0",
     "@vitest/coverage-v8": "^4.1.10",
     "minimatch": "^10.2.5",
@@ -30,6 +31,7 @@
   },
   "dependencies": {
     "@sentry/cloudflare": "^10.63.0",
+    "dns-packet": "^5.6.1",
     "hono": "^4.12.25",
     "jose": "^6.2.3"
   }
