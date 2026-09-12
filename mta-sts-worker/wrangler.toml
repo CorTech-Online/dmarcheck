@@ -1,6 +1,6 @@
 name = "mta-sts-dmarc-mx"
 main = "src/index.ts"
-compatibility_date = "2025-03-30"
+compatibility_date = "2026-06-30"
 
 routes = [
   { pattern = "mta-sts.dmarc.mx", custom_domain = true },

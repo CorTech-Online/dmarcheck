@@ -25,6 +25,24 @@ import { analyzeMtaSts } from "../../src/analyzers/mta-sts.js";
 // you before users notice.
 describe("analyzeMtaSts (runs inside real workerd runtime)", () => {
   it("successfully fetches and parses the dmarc.mx MTA-STS policy (regression guard for #58/#92)", async () => {
+    // Warm-up fetch (#730): on the first outbound request of a fresh workerd
+    // boot, cold DNS resolution + cold TLS handshake to mta-sts.dmarc.mx can
+    // by themselves eat a large chunk of the analyzer's internal 3s
+    // AbortSignal (src/analyzers/mta-sts.ts), so `fetchPolicy` aborts and
+    // swallows it into a false-negative `null` policy below — a cold-start
+    // flake, not a real regression. This request isn't bound by that 3s
+    // budget (it isn't what's under test) and its outcome is discarded
+    // either way; it exists only to prime DNS/TLS for the timed fetch that
+    // follows. It does NOT weaken the regression guard: if `redirect:
+    // "error"` is reintroduced, workerd throws a TypeError immediately
+    // (not after a timeout), so `analyzeMtaSts` below still fails just as
+    // fast whether or not this warm-up ran. Do not remove this as
+    // "redundant" — it is load-bearing for cold-start reliability.
+    await fetch("https://mta-sts.dmarc.mx/.well-known/mta-sts.txt", {
+      redirect: "manual",
+      signal: AbortSignal.timeout(10_000),
+    }).catch(() => {});
+
     const result = await analyzeMtaSts("dmarc.mx");
 
     // Key assertion — the fetch must have completed successfully inside

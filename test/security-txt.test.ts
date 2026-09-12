@@ -13,12 +13,40 @@ function mockFetchByUrl(
     if (!r) {
       return { ok: false, type: "default" } as unknown as Response;
     }
-    return {
-      ok: r.ok ?? true,
-      type: "default",
-      arrayBuffer: async () => new TextEncoder().encode(r.body).buffer,
-    } as unknown as Response;
+    // fetchSecurityTxt reads from resp.body with a stream reader, so the mock
+    // has to be a real Response with a real body stream.
+    return new Response(r.body, {
+      status: (r.ok ?? true) ? 200 : 404,
+    }) as unknown as Response;
   });
+}
+
+// A Response over a real stream that records how many chunks the consumer
+// actually pulled. That count is the difference between bounding the read and
+// buffering first: a reader that stops at the cap pulls only the chunks it
+// needs, while resp.arrayBuffer() drains every chunk the sender offers.
+function streamingResponse(body: string, chunkBytes: number) {
+  const bytes = new TextEncoder().encode(body);
+  const chunks: Uint8Array[] = [];
+  for (let i = 0; i < bytes.length; i += chunkBytes) {
+    chunks.push(bytes.subarray(i, i + chunkBytes));
+  }
+  const pulled = { chunks: 0 };
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (pulled.chunks >= chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunks[pulled.chunks]);
+      pulled.chunks++;
+    },
+  });
+  return {
+    response: new Response(stream) as unknown as Response,
+    pulled,
+    totalChunks: chunks.length,
+  };
 }
 
 beforeEach(() => {
@@ -242,6 +270,79 @@ iQE... (snip)
 
   it("returns info+null when fetch throws", async () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("DNS error"));
+    const result = await analyzeSecurityTxt("example.com");
+    expect(result.status).toBe("info");
+    expect(result.fields).toBeNull();
+  });
+
+  // The cap has to be applied while reading, not after. resp.arrayBuffer()
+  // resolves only once the whole body is resident in the isolate, so slicing
+  // afterwards bounds parser cost but not peak memory — and the 3s
+  // AbortSignal bounds elapsed time, not bytes. The URL is derived from a
+  // user-supplied domain on a public endpoint, so the sender is
+  // attacker-controlled.
+  it("stops reading the body once MAX_BODY_BYTES is reached", async () => {
+    const maxBodyBytes = 64 * 1024; // mirrors MAX_BODY_BYTES in the analyzer
+    const chunkBytes = 8 * 1024;
+    const future = new Date(
+      Date.now() + 30 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const body = `Contact: mailto:security@example.com\nExpires: ${future}\n${"#".repeat(
+      maxBodyBytes * 8,
+    )}\nContact: mailto:sneaky@evil.example\n`;
+    const { response, pulled, totalChunks } = streamingResponse(
+      body,
+      chunkBytes,
+    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+
+    const result = await analyzeSecurityTxt("example.com");
+
+    // Fields before the cap still parse exactly as they do today.
+    expect(result.fields?.contact).toEqual(["mailto:security@example.com"]);
+    // Anything past the cap never reaches the parser.
+    expect(result.fields?.contact).not.toContain("mailto:sneaky@evil.example");
+    // The body is many times the cap, so a bounded read leaves most of it
+    // unpulled. Two chunks of slack for stream read-ahead.
+    expect(totalChunks).toBeGreaterThan(32);
+    expect(pulled.chunks).toBeLessThanOrEqual(maxBodyBytes / chunkBytes + 2);
+  });
+
+  // The cancel() is best-effort cleanup. If it rejects, the bytes we already
+  // read are still good — and fetchSecurityTxt must never throw out to the
+  // orchestrator, which would turn an informational card into a synthetic
+  // "fail".
+  it("still parses the file when cancelling the body rejects", async () => {
+    const future = new Date(
+      Date.now() + 30 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const bytes = new TextEncoder().encode(
+      `Contact: mailto:security@example.com\nExpires: ${future}\n${"#".repeat(
+        64 * 1024 * 2,
+      )}\n`,
+    );
+    let sent = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(bytes.subarray(sent, sent + 8 * 1024));
+        sent += 8 * 1024;
+      },
+      cancel() {
+        throw new Error("connection already gone");
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(stream) as unknown as Response,
+    );
+
+    const result = await analyzeSecurityTxt("example.com");
+    expect(result.fields?.contact).toEqual(["mailto:security@example.com"]);
+  });
+
+  it("returns info+null when the response carries no body", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(null, { status: 200 }) as unknown as Response,
+    );
     const result = await analyzeSecurityTxt("example.com");
     expect(result.status).toBe("info");
     expect(result.fields).toBeNull();

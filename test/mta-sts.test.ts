@@ -15,23 +15,43 @@ beforeEach(() => {
   vi.restoreAllMocks();
 });
 
-// fetchPolicy reads the body via resp.arrayBuffer() (size-capped, mirroring
-// security-txt) — so the mock must expose arrayBuffer, not just text.
+// fetchPolicy reads the body from resp.body with a stream reader, so the mock
+// has to be a real Response with a real body stream — a bare object carrying
+// an arrayBuffer() method no longer exercises the code under test.
 function mockFetchPolicy(body: string | null, ok = true) {
   vi.spyOn(globalThis, "fetch").mockResolvedValue(
     body === null
-      ? ({
-          ok: false,
-          text: async () => "",
-          arrayBuffer: async () => new ArrayBuffer(0),
-        } as Response)
-      : ({
-          ok,
-          text: async () => body,
-          arrayBuffer: async () =>
-            new TextEncoder().encode(body).buffer as ArrayBuffer,
-        } as Response),
+      ? (new Response("", { status: 404 }) as unknown as Response)
+      : (new Response(body, { status: ok ? 200 : 404 }) as unknown as Response),
   );
+}
+
+// A Response over a real stream that records how many chunks the consumer
+// actually pulled. That count is the difference between bounding the read and
+// buffering first: a reader that stops at the cap pulls only the chunks it
+// needs, while resp.arrayBuffer() drains every chunk the sender offers.
+function streamingResponse(body: string, chunkBytes: number) {
+  const bytes = new TextEncoder().encode(body);
+  const chunks: Uint8Array[] = [];
+  for (let i = 0; i < bytes.length; i += chunkBytes) {
+    chunks.push(bytes.subarray(i, i + chunkBytes));
+  }
+  const pulled = { chunks: 0 };
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (pulled.chunks >= chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunks[pulled.chunks]);
+      pulled.chunks++;
+    },
+  });
+  return {
+    response: new Response(stream) as unknown as Response,
+    pulled,
+    totalChunks: chunks.length,
+  };
 }
 
 function mockFetchError() {
@@ -88,6 +108,83 @@ describe("analyzeMtaSts", () => {
     expect(result.policy?.mx).toContain("legit.example.com");
     // The sentinel sits beyond the byte cap, so it must never reach the parser.
     expect(result.policy?.mx).not.toContain("sneaky.evil.example");
+  });
+
+  // The cap has to be applied while reading, not after. resp.arrayBuffer()
+  // resolves only once the whole body is resident in the isolate, so slicing
+  // afterwards bounds parser cost but not peak memory — and the 3s
+  // AbortSignal bounds elapsed time, not bytes. mta-sts.<domain> is derived
+  // from a user-supplied domain on a public endpoint, so the sender is
+  // attacker-controlled.
+  it("stops reading the policy body once MAX_POLICY_BYTES is reached", async () => {
+    mockQueryTxt.mockResolvedValue({
+      entries: ["v=STSv1; id=20240101"],
+      raw: "v=STSv1; id=20240101",
+    });
+    const chunkBytes = 8 * 1024;
+    const body = `version: STSv1\nmode: enforce\nmx: legit.example.com\nmax_age: 86400\n${"#".repeat(
+      MAX_POLICY_BYTES * 8,
+    )}\n`;
+    const { response, pulled, totalChunks } = streamingResponse(
+      body,
+      chunkBytes,
+    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+
+    const result = await analyzeMtaSts("example.com");
+
+    // Directives before the cap still parse exactly as they do today.
+    expect(result.policy?.mx).toContain("legit.example.com");
+    // The body is many times the cap, so a bounded read leaves most of it
+    // unpulled. Two chunks of slack for stream read-ahead.
+    expect(totalChunks).toBeGreaterThan(32);
+    expect(pulled.chunks).toBeLessThanOrEqual(
+      MAX_POLICY_BYTES / chunkBytes + 2,
+    );
+  });
+
+  // The cancel() is best-effort cleanup. If it rejects, the bytes we already
+  // read are still good — and fetchPolicy must never throw out to the
+  // orchestrator, which would turn a live policy into a synthetic "fail".
+  it("still parses the policy when cancelling the body rejects", async () => {
+    mockQueryTxt.mockResolvedValue({
+      entries: ["v=STSv1; id=20240101"],
+      raw: "v=STSv1; id=20240101",
+    });
+    const bytes = new TextEncoder().encode(
+      `version: STSv1\nmode: enforce\nmx: legit.example.com\nmax_age: 86400\n${"#".repeat(
+        MAX_POLICY_BYTES * 2,
+      )}\n`,
+    );
+    let sent = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(bytes.subarray(sent, sent + 8 * 1024));
+        sent += 8 * 1024;
+      },
+      cancel() {
+        throw new Error("connection already gone");
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(stream) as unknown as Response,
+    );
+
+    const result = await analyzeMtaSts("example.com");
+    expect(result.policy?.mx).toContain("legit.example.com");
+  });
+
+  it("returns null policy when the response carries no body", async () => {
+    mockQueryTxt.mockResolvedValue({
+      entries: ["v=STSv1; id=20240101"],
+      raw: "v=STSv1; id=20240101",
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(null, { status: 200 }) as unknown as Response,
+    );
+
+    const result = await analyzeMtaSts("example.com");
+    expect(result.policy).toBeNull();
   });
 
   it("passes when DNS record found with v=STSv1", async () => {

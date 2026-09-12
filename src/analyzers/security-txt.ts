@@ -84,22 +84,77 @@ async function fetchSecurityTxt(url: string): Promise<string | null> {
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      await discardBody(resp);
+      return null;
+    }
 
-    // Cap the body size before we decode it — saves both memory and the
-    // cost of running the parser over a runaway response.
-    const buffer = await resp.arrayBuffer();
-    const slice =
-      buffer.byteLength > MAX_BODY_BYTES
-        ? buffer.slice(0, MAX_BODY_BYTES)
-        : buffer;
+    // Bound the body AS IT ARRIVES, not after it lands. resp.arrayBuffer()
+    // resolves only once the whole body is resident in the isolate, so
+    // capping afterwards bounds parser cost but NOT peak memory — and a
+    // Worker's 128 MB limit is shared by every concurrent request in the
+    // isolate. The 3s AbortSignal bounds elapsed time, not bytes, and
+    // Content-Length is whatever the sender claims. The URL is derived from
+    // a user-supplied domain on a public endpoint, so the sender is
+    // attacker-controlled. Read with a reader, stop at MAX_BODY_BYTES, then
+    // cancel so the sender stops transmitting. Same control as mta-sts.
+    const reader = resp.body?.getReader();
+    if (!reader) return null;
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    while (total < MAX_BODY_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+    try {
+      await reader.cancel();
+    } catch {
+      // Best-effort. A rejected cancel (aborted socket, already-disturbed
+      // body) must not throw away the bytes we already read, and must not
+      // escape: the contract is to return a result or null, never to throw.
+    }
+
     return new TextDecoder("utf-8", {
       fatal: false,
       ignoreBOM: false,
-    }).decode(slice);
+    }).decode(concatCapped(chunks, total, MAX_BODY_BYTES));
   } catch {
     return null;
   }
+}
+
+// Release a response body we are not going to read, so the connection closes
+// instead of waiting on a sender we have already rejected. Best-effort: a
+// rejected cancel (already-disturbed body, aborted socket) must not escape,
+// because fetchSecurityTxt's contract is to return null, never to throw.
+async function discardBody(resp: Response): Promise<void> {
+  try {
+    await resp.body?.cancel();
+  } catch {
+    // Nothing to do — we are discarding this response either way.
+  }
+}
+
+// Join the chunks we pulled into one buffer, truncated to `cap`. The final
+// chunk can straddle the cap, so the truncation here — not the loop bound —
+// is what makes the decoded bytes identical to the pre-streaming
+// arrayBuffer()+slice(0, cap) output.
+function concatCapped(
+  chunks: Uint8Array[],
+  total: number,
+  cap: number,
+): Uint8Array {
+  const out = new Uint8Array(Math.min(total, cap));
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (offset >= out.length) break;
+    const take = Math.min(chunk.byteLength, out.length - offset);
+    out.set(chunk.subarray(0, take), offset);
+    offset += take;
+  }
+  return out;
 }
 
 function finalize(sourceUrl: string, raw: string): SecurityTxtResult {

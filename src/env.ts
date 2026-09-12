@@ -1,12 +1,28 @@
-import type { RateLimiterDO } from "./rate-limit-do.js";
+// The four `Env` members below come from wrangler.toml bindings
+// (`[[d1_databases]]`, `[[durable_objects.bindings]]`, `[[send_email]]`,
+// `[[kv_namespaces]]`) and are picked from `GeneratedBindings` — the ambient
+// interface `npm run types` (wrangler types --include-runtime=false
+// --env-interface=GeneratedBindings) writes to worker-configuration.d.ts,
+// included in tsconfig.json's `include`. Renaming or removing one of those
+// bindings and regenerating drops it from `GeneratedBindings`, which fails
+// `npm run typecheck` here instead of only failing at runtime on the
+// deployed Worker. Everything else in this interface is a secret provisioned
+// out-of-band via `wrangler secret put`, or a `[vars]` value — neither is
+// covered by `wrangler types` in a form worth generating (vars would come
+// back as literal types pinned to their current committed value), so those
+// members stay hand-written.
+type ConfigBindings = Pick<
+  GeneratedBindings,
+  "DB" | "RATE_LIMITER" | "EMAIL" | "INBOX_TOKENS"
+>;
 
 export interface Env {
-  DB: D1Database;
+  DB: ConfigBindings["DB"];
   // Atomic per-identity rate-limit counter (GHSA-v7qc-7qh8-h69g). Optional so
   // self-host deploys without the binding fall back to the in-memory limiter
   // (see checkRateLimit in src/rate-limit.ts); the hosted dmarc.mx worker has
   // it wired in wrangler.toml.
-  RATE_LIMITER?: DurableObjectNamespace<RateLimiterDO>;
+  RATE_LIMITER?: ConfigBindings["RATE_LIMITER"];
   WORKOS_CLIENT_ID: string;
   WORKOS_CLIENT_SECRET: string;
   WORKOS_REDIRECT_URI: string;
@@ -20,7 +36,7 @@ export interface Env {
   SENTRY_DSN?: string;
   // Cloudflare Email Sending binding. Optional so self-host deploys without
   // a verified sender still boot; the dispatcher no-ops when absent.
-  EMAIL?: SendEmail;
+  EMAIL?: ConfigBindings["EMAIL"];
   // Short-lived KV store for inbound test-email scanning (issue #417). Keyed
   // by capability token: a pending reservation on issuance, overwritten with
   // the parsed authentication verdict when the Email Worker `email()` handler
@@ -29,7 +45,7 @@ export interface Env {
   // boot — the /check/email route and SSE stream degrade gracefully when it is
   // absent. This is the repo's first KV namespace; the SSE *scan* cache
   // (src/cache.ts) uses the Cache API, not KV.
-  INBOX_TOKENS?: KVNamespace;
+  INBOX_TOKENS?: ConfigBindings["INBOX_TOKENS"];
   // Stripe billing (Phase 3 M2). All three must be present for billing to
   // activate; isBillingEnabled() in src/billing/feature-flag.ts gates paid
   // code paths so self-hosters without Stripe keys still get a working
