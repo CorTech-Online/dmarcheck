@@ -122,25 +122,83 @@ async function fetchPolicy(domain: string): Promise<MtaStsPolicy | null> {
     // `resp.type` is cast to string because @cloudflare/workers-types narrows
     // it to `"default" | "error"`, even though the runtime also emits
     // `"opaqueredirect"` when a 3xx is encountered under `redirect: "manual"`.
-    if ((resp.type as string) === "opaqueredirect") return null;
-    if (!resp.ok) return null;
+    if ((resp.type as string) === "opaqueredirect") {
+      await discardBody(resp);
+      return null;
+    }
+    if (!resp.ok) {
+      await discardBody(resp);
+      return null;
+    }
 
-    // Bound the body before decoding — reading via arrayBuffer()+slice caps
-    // memory regardless of a lying Content-Length or a slow infinite stream
-    // (the 3s AbortSignal bounds time, not bytes). Same control as security-txt.
-    const buffer = await resp.arrayBuffer();
-    const slice =
-      buffer.byteLength > MAX_POLICY_BYTES
-        ? buffer.slice(0, MAX_POLICY_BYTES)
-        : buffer;
+    // Bound the body AS IT ARRIVES, not after it lands. resp.arrayBuffer()
+    // resolves only once the whole body is resident in the isolate, so
+    // capping afterwards bounds parser cost but NOT peak memory — and a
+    // Worker's 128 MB limit is shared by every concurrent request in the
+    // isolate. The 3s AbortSignal bounds elapsed time, not bytes, and
+    // Content-Length is whatever the sender claims. mta-sts.<domain> is
+    // derived from a user-supplied domain on a public endpoint, so the
+    // sender is attacker-controlled. Read with a reader, stop at
+    // MAX_POLICY_BYTES, then cancel so the sender stops transmitting.
+    // Same control as security-txt.
+    const reader = resp.body?.getReader();
+    if (!reader) return null;
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    while (total < MAX_POLICY_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+    try {
+      await reader.cancel();
+    } catch {
+      // Best-effort. A rejected cancel (aborted socket, already-disturbed
+      // body) must not throw away the bytes we already read, and must not
+      // escape: the contract is to return a result or null, never to throw.
+    }
+
     const text = new TextDecoder("utf-8", {
       fatal: false,
       ignoreBOM: false,
-    }).decode(slice);
+    }).decode(concatCapped(chunks, total, MAX_POLICY_BYTES));
     return parsePolicy(text);
   } catch {
     return null;
   }
+}
+
+// Release a response body we are not going to read, so the connection closes
+// instead of waiting on a sender we have already rejected. Best-effort: a
+// rejected cancel (already-disturbed body, aborted socket) must not escape,
+// because fetchPolicy's contract is to return null, never to throw.
+async function discardBody(resp: Response): Promise<void> {
+  try {
+    await resp.body?.cancel();
+  } catch {
+    // Nothing to do — we are discarding this response either way.
+  }
+}
+
+// Join the chunks we pulled into one buffer, truncated to `cap`. The final
+// chunk can straddle the cap, so the truncation here — not the loop bound —
+// is what makes the decoded bytes identical to the pre-streaming
+// arrayBuffer()+slice(0, cap) output.
+function concatCapped(
+  chunks: Uint8Array[],
+  total: number,
+  cap: number,
+): Uint8Array {
+  const out = new Uint8Array(Math.min(total, cap));
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (offset >= out.length) break;
+    const take = Math.min(chunk.byteLength, out.length - offset);
+    out.set(chunk.subarray(0, take), offset);
+    offset += take;
+  }
+  return out;
 }
 
 function parsePolicy(text: string): MtaStsPolicy {
