@@ -16,7 +16,7 @@
   "devDependencies": {
     "@biomejs/biome": "^2.5.2",
     "@cloudflare/vitest-pool-workers": "^0.16.19",
-    "@cloudflare/workers-types": "^4.20260611.1",
+    "@cloudflare/workers-types": "^5.20260708.1",
     "@emnapi/core": "^1.11.1",
     "@emnapi/runtime": "^1.11.1",
     "@types/node": "^26.1.0",
