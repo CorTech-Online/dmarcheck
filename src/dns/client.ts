@@ -1,5 +1,7 @@
 import dns from "node:dns";
 import * as Sentry from "@sentry/cloudflare";
+import type { Answer, StringAnswer } from "dns-packet";
+import { decode, encode, RECURSION_DESIRED } from "dns-packet";
 import { DnsLookupError } from "./errors.js";
 // Type-only: enforcement is a runtime `budget?.consume()` call, so no value
 // import of scan-budget.ts is emitted here.
@@ -209,119 +211,33 @@ export async function queryDoh(
   }
 }
 
-// DNS header flags for a minimal standard query: QR=0 (query), Opcode=0,
-// RD=1 (recursion desired) — the only bit a resolver needs set to answer.
-const DNS_QUERY_FLAGS = 0x0100;
-
-// Encodes a single-question, type-A DNS query into RFC 1035 wire format so it
-// can travel as an RFC 8484 DoH POST body instead of a GET query string.
-// Only queryDnsbl needs this: its query name embeds a secret DQS key, and a
-// GET's URL would put that key in `url.full`/`url.query` — which Workers
-// Traces spans record automatically with no scrubbing hook (#728). This is a
-// small, fixed encoder for exactly this shape (no compression, no EDNS,
-// QTYPE hardcoded to A) — not a general DNS library.
-function encodeDnsQueryA(name: string): Uint8Array {
-  const encoder = new TextEncoder();
-  const qname: number[] = [];
-  for (const label of name.split(".")) {
-    if (label.length === 0) continue;
-    const bytes = encoder.encode(label);
-    if (bytes.length > 63) {
-      throw new Error("DNS label exceeds 63 octets");
-    }
-    qname.push(bytes.length, ...bytes);
-  }
-  qname.push(0); // root label terminator
-
-  return new Uint8Array([
-    0x00,
-    0x00, // ID — unused; DoH is one request/response over HTTP, nothing to
-    // disambiguate the way multiplexed queries on one socket would need.
-    (DNS_QUERY_FLAGS >> 8) & 0xff,
-    DNS_QUERY_FLAGS & 0xff,
-    0x00,
-    0x01, // QDCOUNT = 1
-    0x00,
-    0x00, // ANCOUNT = 0
-    0x00,
-    0x00, // NSCOUNT = 0
-    0x00,
-    0x00, // ARCOUNT = 0
-    ...qname,
-    0x00,
-    0x01, // QTYPE = A
-    0x00,
-    0x01, // QCLASS = IN
-  ]);
+// True for an Answer whose RDATA dns-packet already decoded to a dotted-quad
+// string — i.e. a type-A record. dns-packet's own types group A together
+// with AAAA/CNAME/NS/PTR under one "string data" variant, so a plain
+// `type === "A"` check doesn't narrow far enough for TS to allow `.data`;
+// this guard re-validates `data` is actually a string at runtime too, so a
+// malformed/hostile answer can't slip a non-string through.
+function isARecordAnswer(
+  answer: Answer,
+): answer is StringAnswer & { type: "A"; data: string } {
+  return answer.type === "A" && typeof answer.data === "string";
 }
 
-// Skips one (possibly compressed) NAME field in a wire-format DNS message,
-// returning the offset just past it. A compression pointer (top two bits of
-// the length byte set) is always exactly two bytes; the decoder never needs
-// to follow it because it only reads what comes AFTER each name, never the
-// name itself.
-function skipDnsName(buf: Uint8Array, offset: number): number {
-  while (offset < buf.length) {
-    const len = buf[offset];
-    if (len === 0) return offset + 1;
-    if ((len & 0xc0) === 0xc0) return offset + 2;
-    offset += 1 + len;
-  }
-  return offset;
-}
-
-// Decodes just enough of an RFC 1035 wire-format response to answer a type-A
-// DNSBL query: the RCODE (for NXDOMAIN detection, mirroring DohResponse.Status
-// from the JSON API) and any A-record RDATA.
-function decodeDnsResponseA(buf: Uint8Array): {
-  rcode: number;
-  aRecords: string[];
-} {
-  if (buf.length < 12) {
-    throw new Error("DNS response shorter than header");
-  }
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const rcode = view.getUint16(2) & 0x0f;
-  const qdcount = view.getUint16(4);
-  const ancount = view.getUint16(6);
-
-  let offset = 12;
-  for (let i = 0; i < qdcount; i++) {
-    offset = skipDnsName(buf, offset) + 4; // + QTYPE + QCLASS
-  }
-
-  const aRecords: string[] = [];
-  for (let i = 0; i < ancount; i++) {
-    offset = skipDnsName(buf, offset);
-    const type = view.getUint16(offset);
-    const rdlength = view.getUint16(offset + 8);
-    const rdataOffset = offset + 10;
-    if (type === 1 && rdlength === 4) {
-      aRecords.push(
-        `${buf[rdataOffset]}.${buf[rdataOffset + 1]}.${buf[rdataOffset + 2]}.${buf[rdataOffset + 3]}`,
-      );
-    }
-    offset = rdataOffset + rdlength;
-  }
-
-  return { rcode, aRecords };
-}
-
-// DNSBL/RBL lookup — RFC 8484 DoH POST with a wire-format body (RFC 1035),
-// not the GET-with-query-string shape queryDoh uses. The query name embeds a
-// per-account Spamhaus DQS key (`<reversed-ip>.<key>.<zone>`), which is a
-// deploy secret; POSTing the name in the body (rather than the URL) means the
-// request URL is the bare endpoint with no query string at all, so nothing
-// about the lookup lands in `url.full`/`url.query` on an outbound fetch span
-// (#728). Breadcrumbs and error messages still never carry the full name —
-// only the reversed IP + zone are logged, with the key replaced by a redacted
-// placeholder — as defense-in-depth against a future path that echoes
-// request details.
+// DNSBL/RBL lookup — RFC 8484 DoH POST with an RFC 1035 wire-format body
+// (via the vetted `dns-packet` library, #736), not the GET-with-query-string
+// shape queryDoh uses. The query name embeds a per-account Spamhaus DQS key
+// (`<reversed-ip>.<key>.<zone>`), which is a deploy secret; POSTing the name
+// in the body (rather than the URL) means the request URL is the bare
+// endpoint with no query string at all, so nothing about the lookup lands
+// in `url.full`/`url.query` on an outbound fetch span (#728). Breadcrumbs
+// and error messages still never carry the full name — only the reversed IP
+// + zone are logged, with the key replaced by a redacted placeholder — as
+// defense-in-depth against a future path that echoes request details.
 //
 // Returns the listing A-record values (e.g. ["127.0.0.2"]) when the IP is
 // listed, null when not listed (NXDOMAIN / no answer), and throws
-// DnsLookupError on SERVFAIL/timeout so callers surface "could not verify"
-// rather than a false "clean".
+// DnsLookupError on SERVFAIL/timeout/malformed response so callers surface
+// "could not verify" rather than a false "clean".
 export async function queryDnsbl(
   reversedIp: string,
   key: string,
@@ -345,7 +261,12 @@ export async function queryDnsbl(
           "Content-Type": "application/dns-message",
           Accept: "application/dns-message",
         },
-        body: encodeDnsQueryA(name),
+        body: encode({
+          type: "query",
+          id: 0,
+          flags: RECURSION_DESIRED,
+          questions: [{ type: "A", name }],
+        }),
         redirect: "follow",
       }),
       DNS_TIMEOUT_MS,
@@ -356,9 +277,14 @@ export async function queryDnsbl(
         `DNSBL query returned HTTP ${resp.status}`,
       );
     }
-    const { rcode, aRecords } = decodeDnsResponseA(
-      new Uint8Array(await resp.arrayBuffer()),
-    );
+    // dns-packet.decode throws on a malformed/truncated buffer — caught
+    // below and turned into the same generic DnsLookupError as any other
+    // failure, never an unhandled throw and never a false "not listed".
+    const decoded = decode(Buffer.from(await resp.arrayBuffer()));
+    const rcode = (decoded.flags ?? 0) & 0x0f; // 3 = NXDOMAIN (RFC 1035 §4.1.1)
+    const aRecords = (decoded.answers ?? [])
+      .filter(isARecordAnswer)
+      .map((a) => a.data);
     if (rcode === 3 || aRecords.length === 0) {
       return null;
     }
