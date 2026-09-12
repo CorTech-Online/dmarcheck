@@ -5,11 +5,25 @@ coverage/
 dist/
 .dev.vars
 .worktrees/
-.claude/worktrees/
+# `.claude/` is an allowlist, not a denylist. Agent sessions (and future Claude
+# Code features) drop new files in here; on a public repo the safe default for
+# an unrecognized one is "ignored". Add a `!` line to start tracking something.
+# Deliberately not tracked: settings.local.json (per-machine, and a map of which
+# commands auto-approve unattended), plans/ (session scratch), worktrees/.
+.claude/*
+!.claude/agents/
+!.claude/launch.json
+!.claude/settings.json
+!.claude/skills/
+# workflows/ is allowlisted per-file, not per-directory: agent sessions copy
+# plugin-bundled workflow scripts in here to work around `Workflow({ scriptPath })`
+# refusing out-of-cwd paths, and a 47KB vendored copy must not become committable.
+!.claude/workflows/
+.claude/workflows/*
+!.claude/workflows/pr-triage.js
 docs/internal/
 pnpm-lock.yaml
 .jules/
-.claude/
 
 # Security-scan artifacts (vuln-scan / vuln-triage). Point-in-time findings —
 # never commit on a public repo: a list of live unpatched bugs is an attacker

@@ -43,8 +43,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "npm test && npx tsc --noEmit",
-            "timeout": 30,
+            "command": "npm test && npx tsc --noEmit || exit 2",
+            "timeout": 120,
             "statusMessage": "Running tests & typecheck..."
           }
         ]
