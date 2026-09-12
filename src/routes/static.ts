@@ -10,6 +10,8 @@ import {
   OG_IMAGE_PNG_BASE64,
   webManifest,
 } from "../views/favicon.js";
+import { LEARN_MODIFIED } from "../views/learn.js";
+import { MX_MODIFIED } from "../views/mx.js";
 import { JS } from "../views/scripts.js";
 import { CSS } from "../views/styles.js";
 
@@ -164,52 +166,151 @@ Sitemap: https://dmarc.mx/sitemap.xml
   });
 });
 
+// No dedicated JSON-LD dateModified source exists for these pages (unlike
+// /learn and /mx below) — this is the sitemap's own honestly-scoped
+// constant for everything that isn't /learn/* or /mx/*, set to this file's
+// own last content-affecting change (#672). Bump it when materially editing
+// any of the pages below.
+const OTHER_STATIC_LASTMOD = "2026-08-06";
+
 // Static URLs worth reinforcing to search engines. The /check entries are
 // generated from the curated allowlist in src/shared/indexable-domains.ts —
 // every domain listed there is also marked indexable on its scan page, so
 // the sitemap and the per-page robots meta stay in sync.
-const STATIC_SITEMAP_URLS: Array<{ loc: string; priority: string }> = [
-  { loc: "https://dmarc.mx/", priority: "1.0" },
-  { loc: "https://dmarc.mx/pricing", priority: "0.9" },
-  { loc: "https://dmarc.mx/scoring", priority: "0.8" },
-  { loc: "https://dmarc.mx/legal/privacy", priority: "0.3" },
-  { loc: "https://dmarc.mx/learn", priority: "0.7" },
-  { loc: "https://dmarc.mx/learn/dmarc", priority: "0.8" },
-  { loc: "https://dmarc.mx/learn/spf", priority: "0.8" },
-  { loc: "https://dmarc.mx/learn/dkim", priority: "0.7" },
-  { loc: "https://dmarc.mx/learn/bimi", priority: "0.6" },
-  { loc: "https://dmarc.mx/learn/mta-sts", priority: "0.7" },
-  { loc: "https://dmarc.mx/learn/security-txt", priority: "0.6" },
-  { loc: "https://dmarc.mx/learn/tls-rpt", priority: "0.6" },
-  { loc: "https://dmarc.mx/learn/dnssec", priority: "0.7" },
-  { loc: "https://dmarc.mx/learn/dane", priority: "0.6" },
-  { loc: "https://dmarc.mx/mx", priority: "0.7" },
-  { loc: "https://dmarc.mx/mx/outlook", priority: "0.8" },
-  { loc: "https://dmarc.mx/mx/google", priority: "0.8" },
-  { loc: "https://dmarc.mx/mx/mimecast", priority: "0.7" },
-  { loc: "https://dmarc.mx/mx/proofpoint", priority: "0.7" },
-  { loc: "https://dmarc.mx/mx/fastmail", priority: "0.6" },
-  { loc: "https://dmarc.mx/mx/zoho", priority: "0.6" },
-  { loc: "https://dmarc.mx/mx/amazon-ses", priority: "0.6" },
-  { loc: "https://dmarc.mx/mx/cloudflare", priority: "0.6" },
-  { loc: "https://dmarc.mx/llms.txt", priority: "0.2" },
+//
+// `lastmod` is required on every entry (not optional) so that adding a new
+// URL without picking a source fails `npm run typecheck` instead of
+// silently inheriting a default.
+const STATIC_SITEMAP_URLS: Array<{
+  loc: string;
+  priority: string;
+  lastmod: string;
+}> = [
+  { loc: "https://dmarc.mx/", priority: "1.0", lastmod: OTHER_STATIC_LASTMOD },
+  {
+    loc: "https://dmarc.mx/pricing",
+    priority: "0.9",
+    lastmod: OTHER_STATIC_LASTMOD,
+  },
+  {
+    loc: "https://dmarc.mx/scoring",
+    priority: "0.8",
+    lastmod: OTHER_STATIC_LASTMOD,
+  },
+  {
+    loc: "https://dmarc.mx/legal/privacy",
+    priority: "0.3",
+    lastmod: OTHER_STATIC_LASTMOD,
+  },
+  { loc: "https://dmarc.mx/learn", priority: "0.7", lastmod: LEARN_MODIFIED },
+  {
+    loc: "https://dmarc.mx/learn/dmarc",
+    priority: "0.8",
+    lastmod: LEARN_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/learn/spf",
+    priority: "0.8",
+    lastmod: LEARN_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/learn/dkim",
+    priority: "0.7",
+    lastmod: LEARN_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/learn/bimi",
+    priority: "0.6",
+    lastmod: LEARN_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/learn/mta-sts",
+    priority: "0.7",
+    lastmod: LEARN_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/learn/security-txt",
+    priority: "0.6",
+    lastmod: LEARN_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/learn/tls-rpt",
+    priority: "0.6",
+    lastmod: LEARN_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/learn/dnssec",
+    priority: "0.7",
+    lastmod: LEARN_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/learn/dane",
+    priority: "0.6",
+    lastmod: LEARN_MODIFIED,
+  },
+  { loc: "https://dmarc.mx/mx", priority: "0.7", lastmod: MX_MODIFIED },
+  {
+    loc: "https://dmarc.mx/mx/outlook",
+    priority: "0.8",
+    lastmod: MX_MODIFIED,
+  },
+  { loc: "https://dmarc.mx/mx/google", priority: "0.8", lastmod: MX_MODIFIED },
+  {
+    loc: "https://dmarc.mx/mx/mimecast",
+    priority: "0.7",
+    lastmod: MX_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/mx/proofpoint",
+    priority: "0.7",
+    lastmod: MX_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/mx/fastmail",
+    priority: "0.6",
+    lastmod: MX_MODIFIED,
+  },
+  { loc: "https://dmarc.mx/mx/zoho", priority: "0.6", lastmod: MX_MODIFIED },
+  {
+    loc: "https://dmarc.mx/mx/amazon-ses",
+    priority: "0.6",
+    lastmod: MX_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/mx/cloudflare",
+    priority: "0.6",
+    lastmod: MX_MODIFIED,
+  },
+  {
+    loc: "https://dmarc.mx/llms.txt",
+    priority: "0.2",
+    lastmod: OTHER_STATIC_LASTMOD,
+  },
 ];
-const SITEMAP_LASTMOD = "2026-05-24";
 
-function buildSitemapUrls(): Array<{ loc: string; priority: string }> {
+// The 49 curated /check?domain=… pages have no meaningful per-URL modified
+// date (they're generated per scan) — omit <lastmod> for them rather than
+// synthesising a fake one.
+function renderSitemapUrl({
+  loc,
+  priority,
+  lastmod,
+}: {
+  loc: string;
+  priority: string;
+  lastmod?: string;
+}): string {
+  const lastmodTag = lastmod ? `<lastmod>${lastmod}</lastmod>` : "";
+  return `  <url><loc>${loc}</loc>${lastmodTag}<priority>${priority}</priority></url>`;
+}
+
+staticRoutes.get("/sitemap.xml", (c) => {
   const scanUrls = listIndexableScanDomains().map((domain) => ({
     loc: `https://dmarc.mx/check?domain=${encodeURIComponent(domain)}`,
     priority: "0.6",
   }));
-  return [...STATIC_SITEMAP_URLS, ...scanUrls];
-}
-
-staticRoutes.get("/sitemap.xml", (c) => {
-  const urls = buildSitemapUrls()
-    .map(
-      ({ loc, priority }) =>
-        `  <url><loc>${loc}</loc><lastmod>${SITEMAP_LASTMOD}</lastmod><priority>${priority}</priority></url>`,
-    )
+  const urls = [...STATIC_SITEMAP_URLS, ...scanUrls]
+    .map(renderSitemapUrl)
     .join("\n");
   const body = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
