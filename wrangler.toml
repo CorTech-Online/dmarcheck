@@ -8,6 +8,47 @@ routes = [
   { pattern = "dmarc.mx", custom_domain = true },
 ]
 
+# Workers Logs + Workers Traces (Cloudflare: "Production Workers without
+# observability are a black box"). Sentry already captures exceptions and
+# transactions, but it does not emit per-binding operation traces — which D1
+# query in a request failed, how long a KV read took, whether a Durable Object
+# RPC round-tripped. That is the signal the cron-degradation class of bug
+# (#700 / #702) was hardest to diagnose without.
+#
+# The top-level `enabled` flag does NOT turn on traces: `observability.traces`
+# has its own `enabled` key and must be set explicitly. Keep both.
+#
+# Top-level block only — NEVER add an [env.<name>] observability block here
+# (an [env.*] block detached dmarc.mx on 2026-04-26, PRs #203 → #206).
+#
+# Must stay BELOW `routes`: in TOML every bare key after a [table] header
+# belongs to that table, so hoisting this block above `routes` silently
+# swallows the custom-domain route into [observability.traces].
+#
+# SECRET COUPLING — traces vs. DNSBL_DQS_KEY. Workers Traces automatically
+# records `url.full` and `url.query` on every outbound fetch span, with no
+# redaction hook. `queryDnsbl` (src/dns/client.ts) embeds the Spamhaus DQS key
+# in the query NAME, which it sends as a DoH URL query string — so with traces
+# on AND that secret set, the key lands in the trace store in cleartext,
+# defeating the redaction that function does for Sentry. Sampling is not a
+# mitigation: one captured span is one leaked key.
+# Safe today only because DNSBL_DQS_KEY is UNSET in production (verified via
+# `wrangler secret list`, 2026-09-12) and the analyzer no-ops without it.
+# BEFORE setting that secret, read the warning on its block below.
+[observability]
+enabled = true
+
+  # Sample every log line; volume at dmarc.mx's scale is well inside the
+  # included allowance.
+  [observability.logs]
+  head_sampling_rate = 1
+
+  # Traces are far heavier per event than logs, so sample 1%. Enough to
+  # characterise a slow or failing cron run without paying for every request.
+  [observability.traces]
+  enabled = true
+  head_sampling_rate = 0.01
+
 [dev]
 port = 8790
 
@@ -41,6 +82,15 @@ ACCESS_TEAM_DOMAIN = "coryrankin.cloudflareaccess.com"
 # so self-host deploys and the test pool are unaffected. The key is embedded only
 # in the outbound DQS query name (see queryDnsbl in src/dns/client.ts); it is
 # never logged, returned in responses, or written into a cache key.
+#
+# !! DO NOT SET THIS SECRET WHILE [observability.traces] IS ENABLED ABOVE !!
+# `queryDnsbl` sends the key inside a DoH URL query string. Workers Traces
+# records `url.full` / `url.query` on outbound fetch spans automatically and
+# offers no scrubbing, so enabling the analyzer while traces are on writes the
+# key into Cloudflare's trace store in cleartext — the one path the function's
+# careful Sentry redaction does not cover. Turning DNSBL on therefore means
+# EITHER setting `[observability.traces] enabled = false` first, OR landing the
+# structural fix (move the DQS lookup off a URL-bearing transport) first.
 
 [triggers]
 crons = ["17 6 * * *"]

@@ -234,6 +234,13 @@ export async function queryDnsbl(
     data: { type: "A", hostname: redacted },
     level: "info",
   });
+  // The DQS key is part of the query NAME by Spamhaus design, so it travels in
+  // this URL's query string. That is invisible to Sentry (the breadcrumb above
+  // is redacted and the catch below throws a generic message), but NOT to
+  // Workers Traces, which records `url.full`/`url.query` on outbound fetch
+  // spans automatically with no scrubbing hook. Do not set DNSBL_DQS_KEY while
+  // `[observability.traces]` is enabled in wrangler.toml. Structural fix: send
+  // the DQS lookup over a transport whose URL does not carry the name.
   const name = `${reversedIp}.${key}.${zone}`;
   const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=A`;
   try {
