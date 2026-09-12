@@ -42,6 +42,42 @@ ACCESS_TEAM_DOMAIN = "coryrankin.cloudflareaccess.com"
 # in the outbound DQS query name (see queryDnsbl in src/dns/client.ts); it is
 # never logged, returned in responses, or written into a cache key.
 
+# Per-invocation subrequest ceiling (issue #700). In workerd, node:dns is a DoH
+# client that fetch()es cloudflare-dns.com per lookup, so EVERY DNS query is a
+# Workers subrequest — roughly 52 per domain scanned. The nightly cron spends
+# them cumulatively across domains in one invocation, and the Workers Paid
+# default ceiling is 10,000: run 1788934679 died at 192 domains (192 x 52 ~=
+# 10,000), after which every fetch() threw EBADQUERY for the rest of the
+# invocation and 147 domains were false-graded D/F. MAX_DOMAINS_PER_RUN in
+# src/cron/rescan.ts is the workaround for that ceiling; this raises the
+# ceiling itself (Paid allows up to 10M).
+#
+# USAGE-MODEL PREMISE: Cloudflare documents [limits] as "only supported for the
+# Standard Usage Model". A dashboard check on 2026-09-11 (Workers plans page,
+# account f0fc4ca5b74274f7ba892e6c9ec411a7) found Paid advertising "Up to 5 min
+# CPU time per request" — the Standard signature (legacy Bundled was 10 ms,
+# Unbound 30 s). That is strong but INDIRECT: an inference from a plan-page
+# string, not a literal usage-model readout, and it cannot be re-checked from
+# this repo. Treat the ceiling as probably-raised, not proven-raised. On a
+# legacy Bundled or Unbound model this block is accepted by Wrangler and then
+# silently inert — no error, no warning, no deploy-time signal.
+#
+# Inert is safe on its own; it cannot make anything worse. What is NOT safe is
+# raising MAX_DOMAINS_PER_RUN while this is inert — that reproduces #700
+# exactly (147 domains false-graded D/F in one run). Confirm the ceiling
+# actually moved first, by watching the cron.skipped Sentry tag (set in
+# src/index.ts) fall toward zero across live cron runs.
+#
+# This is NOT the per-scan DNS budget. That is ScanBudget / DEFAULT_SCAN_LIMITS
+# in src/dns/scan-budget.ts, a security control (GHSA-f828-8wf8-vqp2) bounding
+# attacker-driven fan-out on a SINGLE scan. The two are unrelated; raising this
+# one must never be read as license to relax that one.
+#
+# Top-level [limits] only — NEVER add an [env.<name>] block here (doing so
+# detached dmarc.mx on 2026-04-26, PRs #203 → #206).
+[limits]
+subrequests = 100000
+
 [triggers]
 crons = ["17 6 * * *"]
 
