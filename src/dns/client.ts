@@ -1,5 +1,7 @@
 import dns from "node:dns";
 import * as Sentry from "@sentry/cloudflare";
+import type { Answer, StringAnswer } from "dns-packet";
+import { decode, encode, RECURSION_DESIRED } from "dns-packet";
 import { DnsLookupError } from "./errors.js";
 // Type-only: enforcement is a runtime `budget?.consume()` call, so no value
 // import of scan-budget.ts is emitted here.
@@ -209,17 +211,33 @@ export async function queryDoh(
   }
 }
 
-// DNSBL/RBL lookup over the Cloudflare DoH JSON API. The query name embeds a
-// per-account Spamhaus DQS key (`<reversed-ip>.<key>.<zone>`), which is a deploy
-// secret — so this function NEVER breadcrumbs or error-messages the full name.
-// Only the reversed IP + zone are logged; the key is replaced with a redacted
-// placeholder, and error messages are generic (the underlying fetch error can
-// echo the request URL, which carries the key, so it is deliberately dropped).
+// True for an Answer whose RDATA dns-packet already decoded to a dotted-quad
+// string — i.e. a type-A record. dns-packet's own types group A together
+// with AAAA/CNAME/NS/PTR under one "string data" variant, so a plain
+// `type === "A"` check doesn't narrow far enough for TS to allow `.data`;
+// this guard re-validates `data` is actually a string at runtime too, so a
+// malformed/hostile answer can't slip a non-string through.
+function isARecordAnswer(
+  answer: Answer,
+): answer is StringAnswer & { type: "A"; data: string } {
+  return answer.type === "A" && typeof answer.data === "string";
+}
+
+// DNSBL/RBL lookup — RFC 8484 DoH POST with an RFC 1035 wire-format body
+// (via the vetted `dns-packet` library, #736), not the GET-with-query-string
+// shape queryDoh uses. The query name embeds a per-account Spamhaus DQS key
+// (`<reversed-ip>.<key>.<zone>`), which is a deploy secret; POSTing the name
+// in the body (rather than the URL) means the request URL is the bare
+// endpoint with no query string at all, so nothing about the lookup lands
+// in `url.full`/`url.query` on an outbound fetch span (#728). Breadcrumbs
+// and error messages still never carry the full name — only the reversed IP
+// + zone are logged, with the key replaced by a redacted placeholder — as
+// defense-in-depth against a future path that echoes request details.
 //
 // Returns the listing A-record values (e.g. ["127.0.0.2"]) when the IP is
 // listed, null when not listed (NXDOMAIN / no answer), and throws
-// DnsLookupError on SERVFAIL/timeout so callers surface "could not verify"
-// rather than a false "clean".
+// DnsLookupError on SERVFAIL/timeout/malformed response so callers surface
+// "could not verify" rather than a false "clean".
 export async function queryDnsbl(
   reversedIp: string,
   key: string,
@@ -235,11 +253,20 @@ export async function queryDnsbl(
     level: "info",
   });
   const name = `${reversedIp}.${key}.${zone}`;
-  const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=A`;
   try {
     const resp = await withTimeout(
-      fetch(url, {
-        headers: { Accept: "application/dns-json" },
+      fetch("https://cloudflare-dns.com/dns-query", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/dns-message",
+          Accept: "application/dns-message",
+        },
+        body: encode({
+          type: "query",
+          id: 0,
+          flags: RECURSION_DESIRED,
+          questions: [{ type: "A", name }],
+        }),
         redirect: "follow",
       }),
       DNS_TIMEOUT_MS,
@@ -250,18 +277,26 @@ export async function queryDnsbl(
         `DNSBL query returned HTTP ${resp.status}`,
       );
     }
-    const data = (await resp.json()) as DohResponse;
-    if (data.Status === 3 || !data.Answer || data.Answer.length === 0) {
+    // dns-packet.decode throws on a malformed/truncated buffer — caught
+    // below and turned into the same generic DnsLookupError as any other
+    // failure, never an unhandled throw and never a false "not listed".
+    const decoded = decode(Buffer.from(await resp.arrayBuffer()));
+    const rcode = (decoded.flags ?? 0) & 0x0f; // 3 = NXDOMAIN (RFC 1035 §4.1.1)
+    const aRecords = (decoded.answers ?? [])
+      .filter(isARecordAnswer)
+      .map((a) => a.data);
+    if (rcode === 3 || aRecords.length === 0) {
       return null;
     }
-    return data.Answer.filter((a) => a.type === 1).map((a) => a.data);
+    return aRecords;
   } catch (err: unknown) {
     if (err instanceof DnsLookupError) throw err;
     if (err instanceof Error && err.message === "DNS timeout") {
       throw new DnsLookupError("DNS_TIMEOUT", "DNSBL query timed out");
     }
-    // Deliberately generic — the underlying error message can include the
-    // request URL, which carries the DQS key.
+    // Deliberately generic, as defense-in-depth (the request URL itself no
+    // longer carries the key, but an error path shouldn't echo query details
+    // either).
     throw new DnsLookupError("ESERVFAIL", "DNSBL query failed");
   }
 }
