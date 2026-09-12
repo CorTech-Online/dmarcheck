@@ -10,7 +10,8 @@
     "test:watch": "vitest",
     "lint": "biome check src/ test/",
     "lint:fix": "biome check --write src/ test/",
-    "typecheck": "tsc --noEmit"
+    "types": "wrangler types --include-runtime=false --env-interface=GeneratedBindings",
+    "typecheck": "wrangler types --check --include-runtime=false --env-interface=GeneratedBindings && tsc --noEmit"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.2",
