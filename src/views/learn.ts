@@ -15,7 +15,7 @@ const LEARN_PUBLISHED = "2026-04-11";
 // Bump when materially editing any learn page prose. It lives here rather than
 // per-function so all pages stay in sync by default. Only this constant moves
 // on edits; LEARN_PUBLISHED stays fixed.
-const LEARN_MODIFIED = "2026-06-12";
+export const LEARN_MODIFIED = "2026-06-12";
 
 interface LearnPageOptions {
   protocol: string; // "DMARC"

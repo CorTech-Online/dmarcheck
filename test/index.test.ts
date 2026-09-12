@@ -8,7 +8,8 @@ import {
   parseSelectors,
 } from "../src/index.js";
 import { _memoryStore } from "../src/rate-limit.js";
-import { LEARN_SIBLINGS } from "../src/views/learn.js";
+import { LEARN_MODIFIED, LEARN_SIBLINGS } from "../src/views/learn.js";
+import { MX_MODIFIED } from "../src/views/mx.js";
 
 vi.mock("../src/cache.js", () => ({
   getCachedScan: vi.fn().mockResolvedValue(null),
@@ -814,6 +815,58 @@ describe("SEO routes", () => {
     const res = await app.request("/sitemap.xml");
     const body = await res.text();
     expect(body).not.toContain("example.com");
+  });
+
+  it("stamps each /learn URL's lastmod with LEARN_MODIFIED", async () => {
+    const res = await app.request("/sitemap.xml");
+    const body = await res.text();
+    expect(body).toContain(
+      `<loc>https://dmarc.mx/learn</loc><lastmod>${LEARN_MODIFIED}</lastmod>`,
+    );
+    expect(body).toContain(
+      `<loc>https://dmarc.mx/learn/dmarc</loc><lastmod>${LEARN_MODIFIED}</lastmod>`,
+    );
+    expect(body).toContain(
+      `<loc>https://dmarc.mx/learn/dane</loc><lastmod>${LEARN_MODIFIED}</lastmod>`,
+    );
+  });
+
+  it("stamps each /mx URL's lastmod with MX_MODIFIED", async () => {
+    const res = await app.request("/sitemap.xml");
+    const body = await res.text();
+    expect(body).toContain(
+      `<loc>https://dmarc.mx/mx</loc><lastmod>${MX_MODIFIED}</lastmod>`,
+    );
+    expect(body).toContain(
+      `<loc>https://dmarc.mx/mx/outlook</loc><lastmod>${MX_MODIFIED}</lastmod>`,
+    );
+    expect(body).toContain(
+      `<loc>https://dmarc.mx/mx/cloudflare</loc><lastmod>${MX_MODIFIED}</lastmod>`,
+    );
+  });
+
+  it("omits <lastmod> for /check?domain=… scan pages (no real per-domain date)", async () => {
+    const res = await app.request("/sitemap.xml");
+    const body = await res.text();
+    expect(body).toContain(
+      "<loc>https://dmarc.mx/check?domain=github.com</loc><priority>0.6</priority>",
+    );
+    expect(body).not.toMatch(/check\?domain=github\.com<\/loc><lastmod>/);
+  });
+
+  it("does not stamp one lastmod value across every emitted URL", async () => {
+    const res = await app.request("/sitemap.xml");
+    const body = await res.text();
+    const lastmods = new Set(
+      [...body.matchAll(/<lastmod>([^<]+)<\/lastmod>/g)].map((m) => m[1]),
+    );
+    // At least three distinct dates: /learn/*, /mx/*, and everything else.
+    expect(lastmods.size).toBeGreaterThanOrEqual(3);
+    // No single value can appear on every <url> — some entries (scan pages)
+    // must have none at all, and learn/mx must differ from each other.
+    const urlCount = [...body.matchAll(/<url>/g)].length;
+    const lastmodCount = [...body.matchAll(/<lastmod>/g)].length;
+    expect(lastmodCount).toBeLessThan(urlCount);
   });
 });
 

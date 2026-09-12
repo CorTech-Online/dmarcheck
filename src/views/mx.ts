@@ -18,7 +18,7 @@ const MX_PUBLISHED = "2026-05-24";
 // Bump when materially editing any /mx page prose. It lives here rather than
 // per-provider so all pages stay in sync by default. Only this constant moves
 // on edits; MX_PUBLISHED stays fixed.
-const MX_MODIFIED = "2026-05-24";
+export const MX_MODIFIED = "2026-05-24";
 
 const MX_FOOTER = `<div class="foss-callout">
     <a href="https://github.com/schmug/dmarcheck" class="foss-link">
